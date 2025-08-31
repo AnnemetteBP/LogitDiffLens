@@ -1,8 +1,28 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
+import pandas as pd
 from ..util.logit_lens_utils.logit_lens_wrapper import LogitLensWrapper
 from ..util.logit_lens_utils.model_device_handling import get_base_model, get_embedding_device
+
+
+
+def save_results_to_csv(results:dict, filename:str):
+    """
+    Save interpretability results dictionary to a CSV file readable by pandas.
+    
+    Args:
+        results (dict): Dictionary returned by analyze_SAFE_interpretability or analyze_UNSAFE_interpretability
+        filename (str): Path to save the CSV file (e.g., 'results.csv')
+    """
+    # Convert nested dictionary to DataFrame
+    df = pd.DataFrame.from_dict(results, orient='index')
+    df.reset_index(inplace=True)
+    df.rename(columns={'index': 'layer_name'}, inplace=True)
+
+    # Save to CSV
+    df.to_csv(filename, index=False)
+    print(f"Results saved to {filename}")
 
 
 def analyze_logit_lens_batch(
