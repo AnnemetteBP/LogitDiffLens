@@ -12,7 +12,7 @@ def llama_blocks_input_locator(model: nn.Module):
     """
     Identifies the input to the transformer blocks.
     """
-    return lambda: model.embed_tokens  # OLMo input embeddings
+    return lambda: model.embed_tokens 
 
 def llama_final_layernorm_locator(model: nn.Module):
     """
@@ -58,7 +58,7 @@ def _get_layer_and_compose_with_ln(model, name):
         ln = lambda x: x
     return lambda x: _get_layer(model, name)(ln(x))
 
-def make_llama_decoder(model, decoder_layer_names=['norm', 'lm_head']):  # Adjusted for OLMo
+def make_llama_decoder(model, decoder_layer_names=['norm', 'lm_head']): 
     _locate_special_modules(model)
 
     decoder_layers = [_get_layer_and_compose_with_ln(model, name) for name in decoder_layer_names]
@@ -78,7 +78,7 @@ def make_llama_decoder(model, decoder_layer_names=['norm', 'lm_head']):  # Adjus
 def make_llama_lens_hooks(
     model,
     layer_names: list,
-    decoder_layer_names: list = ['norm', 'lm_head'],  # Adjusted for OLMo
+    decoder_layer_names: list = ['norm', 'lm_head'],  
     verbose=True,
     start_ix=None,
     end_ix=None,

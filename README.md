@@ -4,7 +4,7 @@
 - Right now measures the interpretability and degradation in models (like PTQ/QAT)
 
 ## Models:
-- [HF1BitLLM/Llama3-8B-1.58-100B-tokens] (https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens)
+- [HF1BitLLM/Llama3-8B-1.58-100B-tokens](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens)
 Fine-tuned on 100B tokens for maximum performance.
 - [HF1BitLLM/Llama3-8B-1.58-Linear-10B-tokens](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-Linear-10B-tokens)
 Fine-tuned on 100B tokens for maximum performance.
