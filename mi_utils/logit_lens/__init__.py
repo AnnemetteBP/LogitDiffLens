@@ -4,7 +4,7 @@ from .logit_lens_interpretability import (
     analyze_logit_lens_batch,
     analyze_UNSAFE_interpretability,
     analyze_SAFE_interpretability,
-    UNSAFE_interpretability_score
+    interpretability_UNSAFE_score
 )
 
 
@@ -13,5 +13,5 @@ __all__ = [
     'analyze_logit_lens_batch',
     'analyze_UNSAFE_interpretability',
     'analyze_SAFE_interpretability',
-    'UNSAFE_interpretability_score',
+    'interpretability_UNSAFE_score',
 ]

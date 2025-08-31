@@ -213,12 +213,14 @@ def analyze_UNSAFE_interpretability(
     return results
 
 
-def UNSAFE_interpretability_score(results:dict) -> tuple[dict,float]:
+def interpretability_UNSAFE_score(results:dict) -> tuple[dict,float]:
     """
     Interpretability Evaluation:
       • Measures the instability of layers.
       • Partition layers for cross-model comparison.
       • Scores degradation in interpretability from UNSAFE analysis.
+      • 1.0 → perfect interpretability, i.e., no NaNs or Infs were encountered in logits, probabilities, or entropy across all layers.
+    • 0.0 → extremely degraded, i.e., the layers are mostly NaN/Inf, making the latent structure effectively uninterpretable.
     """
     layer_names = list(results.keys())
     n_layers = len(layer_names)
