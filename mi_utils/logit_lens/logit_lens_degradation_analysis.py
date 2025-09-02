@@ -7,28 +7,17 @@ from ..util.logit_lens_utils.model_device_handling import get_base_model, get_em
 
 
 
-def save_results_to_csv(results:dict, filename:str):
-    """
-    Save interpretability results dictionary to a CSV file readable by pandas.
-    
-    Args:
-        results (dict): Dictionary returned by analyze_SAFE_interpretability or analyze_UNSAFE_interpretability
-        filename (str): Path to save the CSV file (e.g., 'results.csv')
-    """
-    # Convert nested dictionary to DataFrame
-    df = pd.DataFrame.from_dict(results, orient='index')
-    df.reset_index(inplace=True)
-    df.rename(columns={'index': 'layer_name'}, inplace=True)
-
-    # Save to CSV
-    df.to_csv(filename, index=False)
-    print(f"Results saved to {filename}")
+# ----------------------------
+# Reusable Inputs
+# ----------------------------
+EPS = 1e-12
+TOPK = 5
 
 
 def analyze_logit_lens_batch(
     wrapper:LogitLensWrapper,
     texts:list[str],
-    top_k:int=5,
+    top_k:int=TOPK,
     decoder=None,
     include_input_layer:bool=True,
     include_embed_tokens:bool=True,
@@ -79,14 +68,14 @@ def analyze_logit_lens_batch(
     return results
 
 
-def analyze_SAFE_interpretability(
+def analyze_SAFE_degradation(
     wrapper:LogitLensWrapper,
     texts:list[str],
-    top_k:int=5,
+    top_k:int=TOPK,
     decoder=None,
     add_eos:bool=True,
     reference_wrapper=None,
-    eps:float=1e-9
+    eps:float=EPS
 ) -> dict:
     """
     Safe interpretability pass:
@@ -186,10 +175,10 @@ def analyze_SAFE_interpretability(
     return results
 
 
-def analyze_UNSAFE_interpretability(
+def analyze_UNSAFE_degradation(
         wrapper:LogitLensWrapper,
         texts:list[str],
-        top_k:int=5,
+        top_k:int=TOPK,
         decoder=None,
         add_eos=True,
         reference_wrapper=None
@@ -231,46 +220,3 @@ def analyze_UNSAFE_interpretability(
         }
 
     return results
-
-
-def interpretability_UNSAFE_score(results:dict) -> tuple[dict,float]:
-    """
-    Interpretability Evaluation:
-      • Partition layers for cross-model comparison.
-      • Scores degradation in interpretability from UNSAFE analysis.
-      • 1.0 → perfect interpretability, i.e., no NaNs or Infs were encountered in logits, probabilities, or entropy across all layers.
-      • 0.0 → extremely degraded, i.e., the layers are mostly NaN/Inf, making the latent structure effectively uninterpretable.
-    """
-    layer_names = list(results.keys())
-    n_layers = len(layer_names)
-    section_bounds = {
-        "first": (0, max(1, n_layers // 10)),
-        "early": (max(1, n_layers // 10), max(1, n_layers // 3)),
-        "mid": (max(1, n_layers // 3), max(1, 2 * n_layers // 3)),
-        "late": (max(1, 2 * n_layers // 3), max(1, 9 * n_layers // 10)),
-        "last": (max(1, 9 * n_layers // 10), n_layers),
-    }
-
-    section_scores = {}
-    for section, (start, end) in section_bounds.items():
-        section_layers = layer_names[start:end]
-        if not section_layers:
-            section_scores[section] = np.nan
-            continue
-
-        rates = []
-        for lname in section_layers:
-            r = results[lname]
-            rates.append(max(
-                r["nan_logits_rate"],
-                r["inf_logits_rate"],
-                r["nan_probs_rate"],
-                r["inf_probs_rate"],
-                r["nan_entropy_rate"],
-                r["inf_entropy_rate"],
-            ))
-        section_scores[section] = float(1.0 - np.mean(rates))
-
-    overall_score = float(np.nanmean(list(section_scores.values())))
-    return section_scores, overall_score
-
