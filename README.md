@@ -19,4 +19,4 @@ pip install git+https://github.com/huggingface/transformers.git@refs/pull/33410/
 - [allenai/OLMo-7B-hf](https://huggingface.co/allenai/OLMo-7B-hf)
 - [NousResearch/DeepHermes-3-Llama-3-3B-Preview](https://huggingface.co/NousResearch/DeepHermes-3-Llama-3-3B-Preview)
 - [NousResearch/DeepHermes-3-Llama-3-8B-Preview](https://huggingface.co/NousResearch/DeepHermes-3-Llama-3-8B-Preview)
-Loading with [Bitsandbytes](https://huggingface.co/docs/transformers/en/quantization/bitsandbytes) 4- and 8-bit.
+- Loading with [Bitsandbytes](https://huggingface.co/docs/transformers/en/quantization/bitsandbytes) 4- and 8-bit.
