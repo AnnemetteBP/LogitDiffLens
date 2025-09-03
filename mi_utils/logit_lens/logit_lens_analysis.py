@@ -10,7 +10,11 @@ from .metric_utils.div_aware_metrics import(
     div_stability_top1,
     div_stability_topk,
     div_accuracy_top1,
-    div_accuracy_topk
+    div_accuracy_topk,
+    div_stability_top1_safe,
+    div_stability_topk_safe,
+    div_accuracy_top1_safe,
+    div_accuracy_topk_safe
 )
 from .metric_utils.logit_lens_helpers import(
     get_activation_tensor,
@@ -128,6 +132,19 @@ def safe_nwd_probs(p: np.ndarray, q: np.ndarray, eps: float = EPS) -> float:
 
     sim = np.dot(p_safe, q_safe) / (norm_p * norm_q)
     return 1.0 - sim
+
+
+def safe_tvd(p: np.ndarray, q: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """
+    Safe total variation distance per token.
+    Clips probabilities and handles NaNs/Infs.
+    """
+    tvd_seq = []
+    for i in range(p.shape[0]):
+        pi, qi = np.clip(np.nan_to_num(p[i], nan=0.0, posinf=1.0, neginf=0.0), eps, 1.0), \
+                 np.clip(np.nan_to_num(q[i], nan=0.0, posinf=1.0, neginf=0.0), eps, 1.0)
+        tvd_seq.append(0.5 * np.sum(np.abs(pi - qi)))
+    return np.array(tvd_seq, dtype=float)
 
 
 def _run_logit_lens(
@@ -386,7 +403,7 @@ def _run_logit_lens(
                 tgt_np_topk = tgt_full[:min_len_topk].astype(int)
 
         # wrapper to safely call divergence metric functions and pad/trim to seq_len_layer
-        def _safe_div_metric(metric_func, arr_np, tgt_np):
+        """def _safe_div_metric(metric_func, arr_np, tgt_np):
             try:
                 out = metric_func(arr_np, tgt_np, tgt_np)
                 if out is None:
@@ -399,13 +416,34 @@ def _run_logit_lens(
                     padded[:copy_len] = out_np[:copy_len]
                 return padded
             except Exception:
+                return _nan_vec(seq_len_layer)"""
+        # wrapper to safely call divergence metric functions and pad/trim to seq_len_layer
+        def _safe_div_metric(metric_func, arr_np, input_ids_np, target_ids_np):
+            try:
+                out = metric_func(arr_np, input_ids_np, target_ids_np)
+                if out is None:
+                    return _nan_vec(seq_len_layer)
+                out_np = np.asarray(out, dtype=float)
+                # pad/trim to seq_len_layer (so DataFrame fields have consistent length)
+                padded = _nan_vec(seq_len_layer)
+                copy_len = min(out_np.shape[0], seq_len_layer)
+                if copy_len > 0:
+                    padded[:copy_len] = out_np[:copy_len]
+                return padded
+            except Exception:
                 return _nan_vec(seq_len_layer)
 
+
         # compute divergence metrics (top1 uses all_preds_arr; topk uses all_topk_preds_arr)
-        div_stab_top1 = _safe_div_metric(div_stability_top1, all_preds_arr, tgt_np_top1)
-        div_acc_top1  = _safe_div_metric(div_accuracy_top1,  all_preds_arr, tgt_np_top1)
-        div_stab_topk = _safe_div_metric(div_stability_topk, all_topk_preds_arr, tgt_np_topk)
-        div_acc_topk  = _safe_div_metric(div_accuracy_topk,  all_topk_preds_arr, tgt_np_topk)
+        #div_stab_top1 = _safe_div_metric(div_stability_top1, all_preds_arr, tgt_np_top1)
+        #div_acc_top1  = _safe_div_metric(div_accuracy_top1,  all_preds_arr, tgt_np_top1)
+        #div_stab_topk = _safe_div_metric(div_stability_topk, all_topk_preds_arr, tgt_np_topk)
+        #div_acc_topk  = _safe_div_metric(div_accuracy_topk,  all_topk_preds_arr, tgt_np_topk)
+        div_stab_top1 = _safe_div_metric(div_stability_top1_safe, all_preds_arr, input_ids_seq_trim, tgt_np_top1)
+        div_acc_top1  = _safe_div_metric(div_accuracy_top1_safe,  all_preds_arr, input_ids_seq_trim, tgt_np_top1)
+        div_stab_topk = _safe_div_metric(div_stability_topk_safe, all_topk_preds_arr, input_ids_seq_trim, tgt_np_topk)
+        div_acc_topk  = _safe_div_metric(div_accuracy_topk_safe,  all_topk_preds_arr, input_ids_seq_trim, tgt_np_topk)
+
 
         for r in rows:
             if r["prompt_id"] == idx:
@@ -414,7 +452,9 @@ def _run_logit_lens(
                 r["div_accuracy_top1"] = div_acc_top1.tolist()
                 r["div_accuracy_topk"] = div_acc_topk.tolist()
 
-    return pd.DataFrame(rows)
+    #return pd.DataFrame(rows)
+    rows_dict = {k: [row[k] for row in rows] for k in rows[0].keys()}
+    return rows_dict
 
 
 def run_logit_lens(
@@ -431,7 +471,7 @@ def run_logit_lens(
     save_layer_probs:bool=False,
 ) -> None:
 
-    df = _run_logit_lens(
+    data = _run_logit_lens(
         wrapper=wrapper,
         prompts=prompts,
         A_acts=A_acts,
@@ -444,5 +484,6 @@ def run_logit_lens(
 
     os.makedirs(save_dir, exist_ok=True)
 
-    csv_path= f"{save_dir}/{dataset_name}_{model_name}.csv"
-    df.to_csv(csv_path, index=False)
+    pt_path= f"{save_dir}/{dataset_name}_{model_name}.pt"
+    #df.to_csv(csv_path, index=False)
+    torch.save(data, pt_path)

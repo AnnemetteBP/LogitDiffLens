@@ -6,7 +6,6 @@ from ..util.logit_lens_utils.logit_lens_wrapper import LogitLensWrapper
 from ..util.logit_lens_utils.model_device_handling import get_base_model, get_embedding_device
 
 
-
 # ----------------------------
 # Reusable Inputs
 # ----------------------------
@@ -176,12 +175,12 @@ def analyze_SAFE_degradation(
 
 
 def analyze_UNSAFE_degradation(
-        wrapper:LogitLensWrapper,
-        texts:list[str],
-        top_k:int=TOPK,
-        decoder=None,
-        add_eos=True,
-        reference_wrapper=None
+    wrapper: LogitLensWrapper,
+    texts: list[str],
+    top_k: int = TOPK,
+    decoder=None,
+    add_eos=True,
+    reference_wrapper=None,
 ) -> dict:
     """
     Unsafe interpretability pass:
@@ -192,31 +191,63 @@ def analyze_UNSAFE_degradation(
     wrapper.model.eval()
     device = wrapper.device
 
-    if add_eos and wrapper.tokenizer.eos_token is not None:
+    if add_eos and wrapper.tokenizer.eos_token_id is not None:
         texts = [t + wrapper.tokenizer.eos_token for t in texts]
 
-    outputs, logits_by_layer, _ = wrapper.forward(texts, project_to_logits=True, decoder=decoder)
+    outputs, logits_by_layer, layer_names = wrapper.forward(
+        texts, project_to_logits=True, decoder=decoder
+    )
 
     toks = wrapper.tokenizer(texts, return_tensors="pt", padding=True, truncation=True)
     targets = toks.input_ids.to(device)[:, 1:]
 
+    # Opt. reference pass
+    ref_logits_by_layer = None
+    if reference_wrapper is not None:
+        _, ref_logits_by_layer, _ = reference_wrapper.forward(
+            texts, project_to_logits=True, decoder=decoder
+        )
+
     results = {}
     for lname, h in logits_by_layer.items():
-        # Keep original dtype for unsafe evaluation
+        # --- keep original dtype ---
         probs = F.softmax(h[:, :-1, :], dim=-1)
         entropy = -(probs * probs.log()).sum(-1)
+
+        # ---- Top-k accuracy ----
         topk_preds = torch.topk(probs, top_k, dim=-1).indices
         correct = (topk_preds == targets.unsqueeze(-1)).any(-1).float()
 
+        # ---- Stability checks ----
+        nan_logits_count = torch.isnan(h).sum().item()
+        inf_logits_count = torch.isinf(h).sum().item()
+
+        nan_probs_count = torch.isnan(probs).sum().item()
+        inf_probs_count = torch.isinf(probs).sum().item()
+
+        nan_entropy_count = torch.isnan(entropy).sum().item()
+        inf_entropy_count = torch.isinf(entropy).sum().item()
+
         results[lname] = {
+            # interpretability proxies
             "entropy_mean": entropy.mean().item(),
+            "entropy_std": entropy.std().item(),
             "topk_acc_mean": correct.mean().item(),
-            "nan_logits_rate": torch.isnan(h).float().mean().item(),
-            "inf_logits_rate": torch.isinf(h).float().mean().item(),
-            "nan_probs_rate": torch.isnan(probs).float().mean().item(),
-            "inf_probs_rate": torch.isinf(probs).float().mean().item(),
-            "nan_entropy_rate": torch.isnan(entropy).float().mean().item(),
-            "inf_entropy_rate": torch.isinf(entropy).float().mean().item(),
+
+            # stability (counts + rates)
+            "nan_logits_count": nan_logits_count,
+            "inf_logits_count": inf_logits_count,
+            "nan_probs_count": nan_probs_count,
+            "inf_probs_count": inf_probs_count,
+            "nan_entropy_count": nan_entropy_count,
+            "inf_entropy_count": inf_entropy_count,
+
+            "nan_logits_rate": nan_logits_count / h.numel(),
+            "inf_logits_rate": inf_logits_count / h.numel(),
+            "nan_probs_rate": nan_probs_count / probs.numel(),
+            "inf_probs_rate": inf_probs_count / probs.numel(),
+            "nan_entropy_rate": nan_entropy_count / entropy.numel(),
+            "inf_entropy_rate": inf_entropy_count / entropy.numel(),
         }
 
     return results

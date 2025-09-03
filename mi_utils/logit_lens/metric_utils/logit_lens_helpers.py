@@ -1,4 +1,5 @@
 from typing import Tuple, List, Any
+import os
 import torch
 from sklearn.decomposition import PCA
 import numpy as np
@@ -14,6 +15,24 @@ from ...util.logit_lens_utils.logit_lens_wrapper import LogitLensWrapper
 # ----------------------------
 EPS = 1e-12
 TOPK = 5
+
+
+def save_degradation_results(
+    results:dict,
+    save_dir:str,
+    model_name:str,
+    dataset_name:str,
+    mode:str="UNSAFE",  # or "UNSAFE"
+):
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = f"{save_dir}/{dataset_name}_{model_name}_{mode}.pt"
+    torch.save(results, save_path)
+    print(f"Saved degradation results to {save_path}")
+
+
+def load_results_from_pt(results):
+    data = torch.load(results)
+    return data
 
 def save_results_to_csv(results:dict, filename:str):
     """
@@ -221,23 +240,6 @@ def align_features(A, B, max_components=None):
     return A_proj, B_proj
 
 
-def mean_cosine_similarity(A, B):
-    if isinstance(A, torch.Tensor):
-        A = A.detach().cpu().numpy()
-    if isinstance(B, torch.Tensor):
-        B = B.detach().cpu().numpy()
-    # Average over sequence dimension
-    a_mean = np.mean(A, axis=0)
-    b_mean = np.mean(B, axis=0)
-    # Pad the smaller vector with zeros
-    if len(a_mean) < len(b_mean):
-        a_mean = np.pad(a_mean, (0, len(b_mean) - len(a_mean)))
-    elif len(b_mean) < len(a_mean):
-        b_mean = np.pad(b_mean, (0, len(a_mean) - len(b_mean)))
-    # Cosine similarity
-    return np.dot(a_mean, b_mean) / (np.linalg.norm(a_mean) * np.linalg.norm(b_mean))
-
-
 def safe_compute_cka(A, B, eps=EPS):
     # Convert to numpy
     if isinstance(A, torch.Tensor):
@@ -271,6 +273,23 @@ def safe_compute_svcca(A, B):
         return np.nan
 
     return compute_svcca(A, B)
+
+
+def mean_cosine_similarity(A, B):
+    if isinstance(A, torch.Tensor):
+        A = A.detach().cpu().numpy()
+    if isinstance(B, torch.Tensor):
+        B = B.detach().cpu().numpy()
+    # Average over sequence dimension
+    a_mean = np.mean(A, axis=0)
+    b_mean = np.mean(B, axis=0)
+    # Pad the smaller vector with zeros
+    if len(a_mean) < len(b_mean):
+        a_mean = np.pad(a_mean, (0, len(b_mean) - len(a_mean)))
+    elif len(b_mean) < len(a_mean):
+        b_mean = np.pad(b_mean, (0, len(a_mean) - len(b_mean)))
+    # Cosine similarity
+    return np.dot(a_mean, b_mean) / (np.linalg.norm(a_mean) * np.linalg.norm(b_mean))
 
 
 def postprocess_logits_topk(

@@ -148,3 +148,134 @@ def div_accuracy_topk(
         else:
             acc[t] = 0.0
     return acc
+
+
+import numpy as np
+
+def div_stability_top1_safe(preds_layers: np.ndarray, input_ids: np.ndarray, target_ids: np.ndarray, normalize: bool = True) -> np.ndarray:
+    """
+    Divergence-aware, carry-over safe Top-1 stability per token.
+    
+    Args:
+        preds_layers: [L, T] predicted token IDs across layers (L layers, T tokens)
+        input_ids:    [T] original input token IDs
+        target_ids:   [T] target token IDs
+        normalize:    if True, divides stability by L to return value in [0,1]
+        
+    Returns:
+        stability: [T] stability per token
+    """
+    L, T = preds_layers.shape
+    stability = np.zeros(T, dtype=float)
+
+    for t in range(T):
+        prev_preds = set([input_ids[t]])  # track input + previous predictions
+        target = target_ids[t]
+
+        first_correct_layer_found = False
+        for l in range(L):
+            pred = preds_layers[l, t]
+            if pred == target and pred not in prev_preds:
+                stability[t] = (l + 1) / L if normalize else (l + 1)
+                first_correct_layer_found = True
+                break
+            prev_preds.add(pred)
+
+        # If all layers are correct but repeated predictions prevented counting
+        if not first_correct_layer_found and np.all(preds_layers[:, t] == target) and target not in prev_preds:
+            stability[t] = 1.0 if normalize else L
+
+    return stability
+
+
+def div_stability_topk_safe(topk_layers: np.ndarray, input_ids: np.ndarray, target_ids: np.ndarray, normalize: bool = True) -> np.ndarray:
+    """
+    Divergence-aware, carry-over safe Top-k stability per token.
+    
+    Args:
+        topk_layers: [L, T, k] predicted token IDs across layers
+        input_ids:   [T] original input token IDs
+        target_ids:  [T] target token IDs
+        normalize:   if True, divides stability by L to return value in [0,1]
+        
+    Returns:
+        stability: [T] stability per token
+    """
+    L, T, k = topk_layers.shape
+    stability = np.zeros(T, dtype=float)
+
+    for t in range(T):
+        prev_preds = set([input_ids[t]])
+        target = target_ids[t]
+
+        first_correct_layer_found = False
+        for l in range(L):
+            layer_preds = set(topk_layers[l, t])
+            if target in layer_preds and target not in prev_preds:
+                stability[t] = (l + 1) / L if normalize else (l + 1)
+                first_correct_layer_found = True
+                break
+            prev_preds.update(layer_preds)
+
+        # Safeguard for repeated predictions across all layers
+        if not first_correct_layer_found and all(target in set(topk_layers[l, t]) for l in range(L)) and target not in prev_preds:
+            stability[t] = 1.0 if normalize else L
+
+    return stability
+
+
+def div_accuracy_top1_safe(preds_layers: np.ndarray, input_ids: np.ndarray, target_ids: np.ndarray, normalize: bool = True):
+    """
+    Divergence-aware, carry-over safe accuracy for Top-1 predictions.
+    """
+    L, T = preds_layers.shape
+    acc = np.zeros(T, dtype=float)
+
+    for t in range(T):
+        preds = preds_layers[:, t]
+        target = target_ids[t]
+        inp = input_ids[t]
+
+        prev_preds = {inp}
+        found = False
+        for l in range(L):
+            if preds[l] == target and target not in prev_preds:
+                acc[t] = 1.0 if normalize else 1
+                found = True
+                break
+            prev_preds.add(preds[l])
+
+        # if all layers are correct but previously counted, assign max
+        if not found and np.all(preds == target):
+            acc[t] = 1.0 if normalize else 1
+
+    return acc
+
+
+def div_accuracy_topk_safe(topk_layers: np.ndarray, input_ids: np.ndarray, target_ids: np.ndarray, normalize: bool = True):
+    """
+    Divergence-aware, carry-over safe accuracy for Top-k predictions.
+    """
+    L, T, k = topk_layers.shape
+    acc = np.zeros(T, dtype=float)
+
+    for t in range(T):
+        topk_preds = topk_layers[:, t, :]
+        target = target_ids[t]
+        inp = input_ids[t]
+
+        prev_preds = {inp}
+        found = False
+        for l in range(L):
+            layer_preds = set(topk_preds[l])
+            if target in layer_preds and target not in prev_preds:
+                acc[t] = 1.0 if normalize else 1
+                found = True
+                break
+            prev_preds.update(layer_preds)
+
+        # if all layers always include target but it was previously “seen”
+        if not found and all(target in set(topk_preds[l]) for l in range(L)):
+            acc[t] = 1.0 if normalize else 1
+
+    return acc

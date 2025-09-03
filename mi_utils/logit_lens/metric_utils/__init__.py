@@ -11,7 +11,11 @@ from .div_aware_metrics import (
     div_stability_top1,
     div_stability_topk,
     div_accuracy_top1,
-    div_accuracy_topk
+    div_accuracy_topk,
+    div_stability_top1_safe,
+    div_stability_topk_safe,
+    div_accuracy_top1_safe,
+    div_accuracy_topk_safe
 )
 
 from .logit_lens_helpers import(
@@ -30,7 +34,9 @@ from .logit_lens_helpers import(
     mean_cosine_similarity,
     safe_compute_svcca,
     postprocess_logits_topk,
-    safe_for_bfloat16
+    safe_for_bfloat16,
+    save_degradation_results,
+    load_results_from_pt
 )
 
 __all__ = [
@@ -44,6 +50,10 @@ __all__ = [
     'div_stability_topk',
     'div_accuracy_top1',
     'div_accuracy_topk',
+    'div_stability_top1_safe',
+    'div_stability_topk_safe',
+    'div_accuracy_top1_safe',
+    'div_accuracy_topk_safe',
     'save_results_to_csv',
     'extract_activations',
     'get_activation_tensor',
@@ -58,5 +68,7 @@ __all__ = [
     'align_features',
     'mean_cosine_similarity',
     'postprocess_logits_topk',
-    'safe_for_bfloat16'
+    'safe_for_bfloat16',
+    'save_degradation_results',
+    'load_results_from_pt'
 ]
