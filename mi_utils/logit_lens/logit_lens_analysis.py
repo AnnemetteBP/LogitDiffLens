@@ -178,7 +178,7 @@ def _run_logit_lens(
     rows: list[dict] = []
     wrapper.model.eval()
     device = get_embedding_device(wrapper.model)
-
+    vocab_size = wrapper.vocab_size
     # -----------------------
     # Forward -> per-layer logits (on device)
     # -----------------------
@@ -452,7 +452,7 @@ def _run_logit_lens(
                 "logits": logits_cur,                # [S,V] CPU tensor
                 "input_ids": input_ids_seq_trim_cpu, # [S] CPU tensor
                 "target_ids": tgt_ids[:valid_len],   # [S] CPU tensor
-                "vocab_size": getattr(wrapper.tokenizer, "vocab_size", None),
+                "vocab_size": vocab_size,
             }
 
             if save_layer_probs:

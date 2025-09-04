@@ -57,6 +57,7 @@ class LogitLensWrapper:
     ) -> None:
         
         self.tokenizer = tokenizer
+        self.vocab_size = self.tokenizer.vocab_size
         self.device = device
         self.decoder_layer_names = decoder_layer_names or ["lm_head"]
         self.max_len = max_len

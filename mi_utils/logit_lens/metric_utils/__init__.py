@@ -8,9 +8,7 @@ from .interp_degradation_scores import (
     degradation_score
 )
 from .carry_over_safe_metrics import (
-    filter_main_layers,
-    prepare_layer_tensors,
-    compute_carry_over_safe_scalar
+    get_carry_over_safe_with_embedding,
 )
 
 from .logit_lens_helpers import(
@@ -58,7 +56,5 @@ __all__ = [
     'safe_for_bfloat16',
     'save_degradation_results',
     'load_results_from_pt',
-    'filter_main_layers',
-    'prepare_layer_tensors',
-    'compute_carry_over_safe_scalar'
+    'get_carry_over_safe_with_embedding'
 ]
