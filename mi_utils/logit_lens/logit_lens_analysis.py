@@ -178,7 +178,6 @@ def _run_logit_lens(
     rows: list[dict] = []
     wrapper.model.eval()
     device = get_embedding_device(wrapper.model)
-    vocab_size = wrapper.vocab_size
     # -----------------------
     # Forward -> per-layer logits (on device)
     # -----------------------
@@ -490,7 +489,6 @@ def run_logit_lens(
         max_len=max_len
     )
 
-    # Convert DataFrame -> dict for saving
     data_dict = {col: data_df[col].tolist() for col in data_df.columns}
 
     os.makedirs(save_dir, exist_ok=True)

@@ -4,18 +4,17 @@ import torch
 import numpy as np
 from typing import List, Tuple
 
+
+
+TOPK = 5
 # -----------------------------------------------------------------------------
 # Core vectorized metric computation (expects layers_tensor: [L, S, V])
 # -----------------------------------------------------------------------------
-def compute_carry_over_safe_with_embedding_vectorized(layers_tensor: torch.Tensor,
-                                                      input_ids: torch.Tensor,
-                                                      target_ids: torch.Tensor,
-                                                      topk: int = 5):
-    """
-    Fully aligned with LaTeX definitions.
-    All metrics are carry-over safe (ignore input tokens) and relative to model depth.
-    Returns dict of scalar metrics.
-    """
+def compute_carry_over_safe_with_embedding_vectorized(layers_tensor:torch.Tensor,
+                                                      input_ids:torch.Tensor,
+                                                      target_ids:torch.Tensor,
+                                                      topk:int=TOPK):
+
     L, S, V = layers_tensor.shape
     device = layers_tensor.device
 
@@ -114,6 +113,7 @@ def canonical_layer_names_from_df(df, prefix='layers.'):
     matches.sort()
     return [n for _, n in matches]
 
+
 def prepare_layer_tensors_for_prompt(df_prompt, canonical_layers: List[str]):
     """
     df_prompt: DataFrame filtered for a single prompt_id with rows for many layer_names (one row per layer)
@@ -154,6 +154,7 @@ def prepare_layer_tensors_for_prompt(df_prompt, canonical_layers: List[str]):
     layers_tensor = torch.stack(layer_tensors, dim=0)  # [L, S, V]
     return layers_tensor, torch.tensor(input_ids, dtype=torch.long), torch.tensor(target_ids, dtype=torch.long)
 
+
 def get_carry_over_safe_with_embedding(saved_df, topk=5, prefix='layers.'):
     """
     saved_df: your loaded DataFrame (torch.load .pt returns the df)
@@ -182,5 +183,3 @@ def get_carry_over_safe_with_embedding(saved_df, topk=5, prefix='layers.'):
         agg[k] = float(np.mean([results_per_prompt[pid][k] for pid in prompt_ids]))
 
     return {'per_prompt': results_per_prompt, 'mean': agg}
-
-
