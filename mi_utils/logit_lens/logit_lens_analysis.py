@@ -6,25 +6,11 @@ import pandas as pd
 from scipy.special import rel_entr
 from ..util.logit_lens_utils.logit_lens_wrapper import LogitLensWrapper
 from ..util.logit_lens_utils.model_device_handling import get_base_model, get_embedding_device
-from .metric_utils.div_aware_metrics import(
-    div_stability_top1,
-    div_stability_topk,
-    div_accuracy_top1,
-    div_accuracy_topk,
-    div_stability_top1_safe,
-    div_stability_topk_safe,
-    div_accuracy_top1_safe,
-    div_accuracy_topk_safe
-)
 from .metric_utils.logit_lens_helpers import(
-    get_activation_tensor,
     compute_ece,
-    safe_compute_cka,
-    safe_compute_svcca,
     compute_ngram_matches,
     compute_ngram_stability,
     topk_overlap_and_kendall,
-    align_features
 )
 
 
@@ -134,7 +120,20 @@ def safe_nwd_probs(p: np.ndarray, q: np.ndarray, eps: float = EPS) -> float:
     return 1.0 - sim
 
 
-def safe_tvd(p: np.ndarray, q: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+def safe_nwd(probs_current_mean, probs_next_mean):
+    """
+    Compute NWD safely. Returns 0.0 if undefined.
+    """
+    try:
+        if probs_current_mean is None or probs_next_mean is None:
+            return 0.0
+        nwd_val = safe_nwd_probs(probs_current_mean, probs_next_mean)
+        return float(nwd_val) if nwd_val is not None else 0.0
+    except Exception:
+        return 0.0
+
+
+def safe_tvd(p: np.ndarray, q: np.ndarray, eps: float = EPS) -> np.ndarray:
     """
     Safe total variation distance per token.
     Clips probabilities and handles NaNs/Infs.
@@ -151,35 +150,57 @@ def _run_logit_lens(
     wrapper: LogitLensWrapper,
     prompts: list[str],
     add_eos: bool = True,
-    A_acts: Optional[dict] = None,
-    B_acts: Optional[dict] = None,
     topk: int = TOPK,
+    eps = EPS,
     skip_input_layer: bool = True,
     include_final_norm: bool = True,
-    save_layer_probs: bool = False
+    save_layer_probs: bool = False,
+    proj_precision: Optional[str] = None,   # "fp16" | "fp32" | None
+    max_len: Optional[int] = 32
 ) -> pd.DataFrame:
 
-    rows = []
+    """
+    Runs a logit-lens analysis with controllable *analysis* precision (fp16/fp32)
+    *without* touching model parameters/dtypes. All heavy tensors are detached and
+    moved to CPU as early as possible to spare GPU VRAM, and most ops are vectorized.
+
+    Notes:
+    - Model weights remain on-device in their original dtype (fp32/fp16/4- or 8-bit).
+    - proj_precision controls ONLY the dtype of the detached logits used for analysis.
+      * None  -> keep the model-produced dtype (if fp32, stays fp32).
+      * "fp32" -> cast detached logits to float32 for analysis.
+      * "fp16" -> cast detached logits to float16 for analysis (be mindful of accuracy).
+    """
+
+    import math
+    torch.set_grad_enabled(False)
+
+    rows: list[dict] = []
     wrapper.model.eval()
     device = get_embedding_device(wrapper.model)
 
-    # --- Forward pass ---
+    # -----------------------
+    # Forward -> per-layer logits (on device)
+    # -----------------------
     outputs, layer_dict, layer_names = wrapper.forward(
         prompts,
         project_to_logits=True,
         return_hidden=False,
         add_eos=add_eos,
-        keep_on_device=True
+        keep_on_device=True,  # keep everything on model device for the forward
+        max_len=max_len
     )
 
-    # --- Stack logits ---
+    # Stack logits into a list[tensor[B,S,V]], still on device
     layer_logits_list, layer_names = wrapper.stack_layer_logits(
         layer_dict,
         keep_on_device=True,
         filter_layers=False
     )
 
-    # --- Filter layers ---
+    # -----------------------
+    # Layer filtering
+    # -----------------------
     valid_layer_names, valid_layer_logits = [], []
     for lname, logits in zip(layer_names, layer_logits_list):
         lname_lower = lname.lower()
@@ -190,271 +211,256 @@ def _run_logit_lens(
         valid_layer_names.append(lname)
         valid_layer_logits.append(logits)
 
+    if len(valid_layer_logits) == 0:
+        return pd.DataFrame([])
+
     num_layers = len(valid_layer_logits)
     batch_size = valid_layer_logits[0].shape[0]
     seq_len = valid_layer_logits[0].shape[1]
+    vocab_size = getattr(wrapper.tokenizer, "vocab_size", None)
 
+    # -----------------------
+    # Determine analysis dtype (for DETACHED tensors only)
+    # -----------------------
+    def _to_analysis_dtype(t: torch.Tensor) -> torch.dtype:
+        if proj_precision is None:
+            # keep what the model produced (e.g., fp32 stays fp32)
+            return t.dtype
+        if proj_precision.lower() == "fp16":
+            return torch.float16
+        if proj_precision.lower() == "fp32":
+            return torch.float32
+        return t.dtype
+
+    # -----------------------
+    # Pre-compute detached CPU logits/probs layer-by-layer
+    #   - Move each layer once to CPU in chosen analysis dtype
+    #   - Compute probs in float32 (for stability), unless explicitly fp16
+    # -----------------------
+    det_logits_cpu: list[torch.Tensor] = []
+    det_probs_cpu: list[torch.Tensor] = []
+
+    for logits in valid_layer_logits:
+        # detach & move to CPU with your requested analysis dtype
+        adtype = _to_analysis_dtype(logits)
+        l_cpu = logits.detach().to("cpu", dtype=adtype, copy=False)
+
+        # softmax in float32 for stability unless user demanded fp16
+        if adtype == torch.float16:
+            probs = torch.softmax(l_cpu.to(torch.float32), dim=-1).to(torch.float16)
+        else:
+            probs = torch.softmax(l_cpu, dim=-1)
+
+        det_logits_cpu.append(l_cpu)              # [B,S,V], cpu, adtype
+        det_probs_cpu.append(probs.contiguous())  # [B,S,V], cpu, fp32 or fp16
+
+    # Targets for correctness/stability (still on device; move to CPU when needed)
+    if hasattr(outputs, "logits") and outputs.logits is not None:
+        # greedy next-token targets: argmax over model head logits
+        # (Do this on GPU then bring the single slice we need)
+        full_pred = outputs.logits.argmax(dim=-1)  # [B,S]
+    else:
+        # Fallback: dummy increasing ids (won't be used if not meaningful)
+        full_pred = torch.arange(seq_len, device=device).unsqueeze(0).repeat(batch_size, 1)
+
+    # -----------------------
+    # Main loop over batch (keeps memory down)
+    # -----------------------
     for idx in range(batch_size):
-        target_ids_seq = outputs.logits.argmax(dim=-1)[idx, 1:] if hasattr(outputs, "logits") else torch.arange(seq_len - 1, device=device)
-        input_ids_seq_trim = target_ids_seq.clone()
-        all_preds, all_topk_preds = [], []
+        # reference target ids: shift by 1 for next-token prediction
+        tgt_ids = full_pred[idx, 1:].detach().cpu()  # [S-1]
+        max_valid_len = tgt_ids.numel()
+
+        # reference input ids for carry-over metrics
+        if hasattr(outputs, "input_ids") and outputs.input_ids is not None:
+            input_ids_seq_trim_cpu = outputs.input_ids[idx, :max_valid_len].detach().cpu()
+        else:
+            input_ids_seq_trim_cpu = torch.arange(max_valid_len, dtype=torch.long)
+
+        # accumulate a few per-layer items
         stability_top1, stability_topk = [], []
 
-        for l, (lname, logits_l_all) in enumerate(zip(valid_layer_names, valid_layer_logits)):
-            logits_tensor = logits_l_all[idx]
-            if not isinstance(logits_tensor, torch.Tensor):
-                logits_tensor = torch.as_tensor(logits_tensor, device=device)
+        for l, lname in enumerate(valid_layer_names):
+            logits_cur = det_logits_cpu[l][idx][:max_valid_len]  # [S,V]
+            probs_cur = det_probs_cpu[l][idx][:max_valid_len]    # [S,V]
 
-            # --- Safe softmax + move to CPU float32 ---
-            probs_tensor = safe_softmax(logits_tensor).detach().cpu().float()
-            # --- Logit / probability metrics ---
-            logit_mean = logits_tensor.mean(dim=-1)
-            logit_std = logits_tensor.std(dim=-1)
-            logit_var = logits_tensor.var(dim=-1)
+            # --- Basic stats ---
+            l32 = logits_cur.to(torch.float32)
+            logit_mean = l32.mean(dim=-1)
+            logit_std  = l32.std(dim=-1)
+            logit_var  = l32.var(dim=-1)
 
-            prob_mean = probs_tensor.mean(dim=-1)
-            prob_std = probs_tensor.std(dim=-1)
-            prob_var = probs_tensor.var(dim=-1)
+            p32 = probs_cur.to(torch.float32)
+            prob_mean = p32.mean(dim=-1)
+            prob_std = p32.std(dim=-1)
+            prob_var = p32.var(dim=-1)
 
             # --- Predictions & Top-K ---
-            preds_seq_tensor = torch.argmax(probs_tensor, dim=-1)
-            topk_idx_tensor = torch.topk(probs_tensor, k=topk, dim=-1).indices
+            preds_seq_tensor = p32.argmax(dim=-1)
+            k_eff = min(topk, p32.shape[-1])
+            topk_idx_tensor = torch.topk(p32, k=k_eff, dim=-1).indices
 
-            valid_len = min(len(target_ids_seq), preds_seq_tensor.shape[0])
-            preds_seq_tensor = preds_seq_tensor[:valid_len]
-            probs_tensor = probs_tensor[:valid_len, :] if valid_len > 0 else torch.zeros((0, probs_tensor.shape[-1]), dtype=torch.float32)
-            target_ids_tensor = target_ids_seq[:valid_len].detach().cpu().numpy()
-
-            # --- Correctness metrics ---
+            # --- Correctness ---
+            valid_len = min(max_valid_len, preds_seq_tensor.shape[0])
             if valid_len > 0:
-                correct_1_seq = (preds_seq_tensor.cpu().numpy() == target_ids_tensor).astype(float).tolist()
-                correct_topk_seq = [float(target_ids_tensor[i] in topk_idx_tensor[i].cpu().numpy()) for i in range(valid_len)]
+                preds_seq = preds_seq_tensor[:valid_len].numpy()
+                tgt_np = tgt_ids[:valid_len].numpy()
+                correct_1_seq = (preds_seq == tgt_np).astype(float).tolist()
+                tk = topk_idx_tensor[:valid_len].numpy()
+                correct_topk_seq = [float(tgt_np[i] in tk[i]) for i in range(valid_len)]
                 correct_1_mean = float(np.mean(correct_1_seq))
                 correct_topk_mean = float(np.mean(correct_topk_seq))
             else:
-                correct_1_seq, correct_topk_seq = [], []
-                correct_1_mean = correct_topk_mean = None
-
-            all_preds.append(preds_seq_tensor)
-            all_topk_preds.append(topk_idx_tensor)
+                preds_seq = np.array([], dtype=np.int64)
+                tgt_np = np.array([], dtype=np.int64)
+                correct_1_seq = []
+                correct_topk_seq = []
+                correct_1_mean = None
+                correct_topk_mean = None
 
             # --- Entropy & normalized entropy ---
-            ent_seq = -(probs_tensor * torch.log(probs_tensor + EPS)).sum(dim=-1).cpu().numpy()
-            normalized_ent_seq = ent_seq / np.log(getattr(wrapper.tokenizer, "vocab_size", np.e))
+            EPS_ = eps if 'EPS' in globals() else 1e-12
+            ent_seq = -(p32.clamp_min(EPS_) * (p32.clamp_min(EPS_).log())).sum(dim=-1).numpy()
+            normalized_ent_seq = ent_seq / math.log(vocab_size) if vocab_size and vocab_size > 1 else ent_seq / np.log(np.e)
 
-            # --- Convert for storage ---
-            preds_seq = preds_seq_tensor.cpu().numpy()
-            probs_seq = probs_tensor.cpu().numpy()
-
+            # --- ECE ---
             try:
-                ece_val = compute_ece(probs_seq, target_ids_tensor)
+                ece_val = compute_ece(p32[:valid_len].numpy(), tgt_np) if valid_len > 0 else None
             except Exception:
                 ece_val = None
 
-            # --- Ngrams & repetition ---
+            # --- N-grams & repetition ---
             ngram_correct, ngram_correct_mean, ngram_stability = {}, {}, {}
-            for n in [2, 3]:
-                if valid_len >= n:
-                    ngram_correct[n] = compute_ngram_matches(preds_seq, target_ids_tensor, n)
-                    ngram_correct_mean[n] = np.nanmean(ngram_correct[n])
-                    if l < num_layers - 1:
-                        next_preds = torch.argmax(valid_layer_logits[l + 1][idx], dim=-1)[:valid_len].cpu().numpy()
-                        ngram_stability[n] = compute_ngram_stability(preds_seq, next_preds, n)
+            for n in (2, 3):
+                try:
+                    if valid_len >= n:
+                        ngram_correct[n] = compute_ngram_matches(preds_seq, tgt_np, n) or []
+                        ngram_correct_mean[n] = float(np.nanmean(ngram_correct[n])) if ngram_correct[n] else None
+                        if l < num_layers - 1:
+                            next_preds = det_probs_cpu[l + 1][idx, :valid_len].to(torch.float32).argmax(dim=-1).numpy()
+                            ngram_stability[n] = compute_ngram_stability(preds_seq, next_preds, n) or []
+                        else:
+                            ngram_stability[n] = []
                     else:
-                        ngram_stability[n] = []
-                else:
+                        ngram_correct[n], ngram_correct_mean[n], ngram_stability[n] = [], None, []
+                except Exception:
                     ngram_correct[n], ngram_correct_mean[n], ngram_stability[n] = [], None, []
 
-            repetition_ratio = float(np.mean(preds_seq[1:] == preds_seq[:-1])) if valid_len > 1 else np.nan
+            try:
+                repetition_ratio = float(np.mean(preds_seq[1:] == preds_seq[:-1])) if valid_len > 1 else np.nan
+            except Exception:
+                repetition_ratio = np.nan
 
-            # --- KL / NWD / Top-K drift ---
+            # --- Drift metrics ---
+            kl_seq, kl_mean, nwd_val, tvd_seq, tvd_mean = [], 0.0, 0.0, [], 0.0
+            jacc_mean = tau_mean = 0.0
+            jacc_seq = tau_seq = []
+
             if l < num_layers - 1 and valid_len > 0:
-                next_probs_tensor = safe_softmax(valid_layer_logits[l + 1][idx])[:valid_len, :].detach().cpu().float()
-                kl_seq = safe_kl_per_token(probs_seq[:valid_len], next_probs_tensor.numpy())
-                kl_mean = float(np.nanmean(kl_seq))
-                nwd_val = safe_nwd_probs(probs_seq[:valid_len].mean(axis=0), next_probs_tensor.numpy().mean(axis=0))
-                jacc_mean, tau_mean, jacc_seq, tau_seq = topk_overlap_and_kendall(probs_seq[:valid_len], next_probs_tensor.numpy(), k=topk)
-                stability_top1.append((preds_seq == np.argmax(next_probs_tensor.numpy(), axis=-1)).tolist())
-                stability_topk.append([int(preds_seq[i] in np.argmax(next_probs_tensor.numpy(), axis=-1)) for i in range(valid_len)])
+                p_cur = p32[:valid_len].numpy()
+                p_next = det_probs_cpu[l + 1][idx, :valid_len].to(torch.float32).numpy()
+
+                try:
+                    kl_seq_raw = safe_kl_per_token(p_cur, p_next)
+                    kl_seq = [float(x) if np.isfinite(x) else np.nan for x in kl_seq_raw]
+                    kl_mean = float(np.nanmean(kl_seq)) if kl_seq else 0.0
+                except Exception:
+                    kl_seq, kl_mean = [], 0.0
+
+                try:
+                    nwd_val_raw = safe_nwd_probs(p_cur.mean(axis=0), p_next.mean(axis=0))
+                    nwd_val = float(nwd_val_raw) if nwd_val_raw is not None else 0.0
+                except Exception:
+                    nwd_val = 0.0
+
+                try:
+                    tvd_seq = safe_tvd(p_cur, p_next)
+                    tvd_mean = float(np.mean(tvd_seq)) if len(tvd_seq) > 0 else 0.0
+                except Exception:
+                    tvd_seq, tvd_mean = [], 0.0
+
+                try:
+                    jacc_mean, tau_mean, jacc_seq, tau_seq = topk_overlap_and_kendall(p_cur, p_next, k=k_eff)
+                    jacc_mean = float(jacc_mean) if jacc_mean is not None else 0.0
+                    tau_mean = float(tau_mean) if tau_mean is not None else 0.0
+                except Exception:
+                    jacc_mean = tau_mean = 0.0
+                    jacc_seq = tau_seq = []
+
+                try:
+                    next_top1 = np.argmax(p_next, axis=-1)
+                    #stability_top1.append((preds_seq[:valid_len] == next_top1).tolist())
+                    stability_top1.append([int(x) for x in (preds_seq[:valid_len] == next_top1)])
+                    stability_topk.append([int(preds_seq[i] == next_top1[i]) for i in range(valid_len)])
+                except Exception:
+                    stability_top1.append([])
+                    stability_topk.append([])
             else:
-                kl_seq = kl_mean = nwd_val = None
-                jacc_mean = tau_mean = []
-                jacc_seq = tau_seq = []
                 stability_top1.append([])
                 stability_topk.append([])
 
-            # --- CKA / SVCCA ---
-            fp_act = get_activation_tensor(A_acts[lname]) if A_acts and lname in A_acts else None
-            quant_act = get_activation_tensor(B_acts[lname]) if B_acts and lname in B_acts else None
-            if isinstance(fp_act, torch.Tensor): fp_act = fp_act.detach().cpu().numpy()
-            if isinstance(quant_act, torch.Tensor): quant_act = quant_act.detach().cpu().numpy()
-            if fp_act is not None and quant_act is not None:
-                fp_proj, q_proj = align_features(fp_act, quant_act)
-                cka_val = safe_compute_cka(fp_proj, q_proj)
-                svcca_val = safe_compute_svcca(fp_proj, q_proj)
-            else:
-                cka_val = svcca_val = np.nan
-
-
             # -------------------------------
-            # Row dict
+            # Row dict (compact + safe)
             # -------------------------------
             row = {
                 "prompt_id": idx,
                 "prompt_text": prompts[idx],
                 "layer_index": l,
                 "layer_name": lname,
-                "seq_len": valid_len,
-                "logit_mean": float(logit_mean.mean().item()) if logit_mean.numel() > 0 else None,
-                "logit_std_mean": float(logit_std.mean().item()) if logit_std.numel() > 0 else None,
-                "logit_var_mean": float(logit_var.mean().item()) if logit_var.numel() > 0 else None,
-                "prob_mean": float(prob_mean.mean().item()) if prob_mean.numel() > 0 else None,
-                "prob_std_mean": float(prob_std.mean().item()) if prob_std.numel() > 0 else None,
-                "prob_var_mean": float(prob_var.mean().item()) if prob_var.numel() > 0 else None,
-                "entropy_mean": float(ent_seq.mean().item()) if ent_seq.numel() > 0 else None,
-                "entropy_seq": ent_seq.detach().cpu().tolist() if ent_seq.numel() > 0 else [],
-                "normalized_entropy_mean": float(normalized_ent_seq.mean().item()) if normalized_ent_seq.numel() > 0 else None,
-                "normalized_entropy_seq": normalized_ent_seq.detach().cpu().tolist() if normalized_ent_seq.numel() > 0 else [],
+                "seq_len": int(valid_len),
+
+                # logits/probs summary
+                "logit_mean": float(logit_mean.mean().item()) if logit_mean.numel() else None,
+                "logit_std_mean": float(logit_std.mean().item()) if logit_std.numel() else None,
+                "logit_var_mean": float(logit_var.mean().item()) if logit_var.numel() else None,
+                "prob_mean": float(prob_mean.mean().item()) if prob_mean.numel() else None,
+                "prob_std_mean": float(prob_std.mean().item()) if prob_std.numel() else None,
+                "prob_var_mean": float(prob_var.mean().item()) if prob_var.numel() else None,
+
+                # entropy
+                "entropy_seq": ent_seq.tolist(),
+                "normalized_entropy_seq": normalized_ent_seq.tolist(),
+
+                # correctness
                 "correct_1_seq": correct_1_seq,
                 "correct_topk_seq": correct_topk_seq,
-                "correct_1_mean": float(torch.tensor(correct_1_seq, device=device).mean().item()) if correct_1_seq else None,
-                "correct_topk_mean": float(torch.tensor(correct_topk_seq, device=device).mean().item()) if correct_topk_seq else None,
-                "kl_next_layer_mean": kl_mean if 'kl_mean' in locals() else None,
-                "kl_next_layer_seq": kl_seq if 'kl_seq' in locals() else [],
-                "nwd": nwd_val if 'nwd_val' in locals() else None,
-                "topk_jaccard_mean": jacc_mean if 'jacc_mean' in locals() else None,
-                "topk_kendall_tau_mean": tau_mean if 'tau_mean' in locals() else None,
-                "topk_jaccard_seq": jacc_seq if 'jacc_seq' in locals() else [],
-                "topk_kendall_tau_seq": tau_seq if 'tau_seq' in locals() else [],
-                "stability_top1_seq": stability_top1[l] if l < len(stability_top1) else [],
-                "stability_topk_seq": stability_topk[l] if l < len(stability_topk) else [],
                 "ece": ece_val,
+
+                # n-grams
                 "ngram_correct_2_seq": ngram_correct.get(2, []),
-                "ngram_correct_2_mean": ngram_correct_mean.get(2),
                 "ngram_correct_3_seq": ngram_correct.get(3, []),
-                "ngram_correct_3_mean": ngram_correct_mean.get(3),
                 "ngram_stability_2_seq": ngram_stability.get(2, []),
                 "ngram_stability_3_seq": ngram_stability.get(3, []),
                 "repetition_ratio": repetition_ratio,
-                "cka_fp_vs_layer": cka_val,
-                "svcca_fp_vs_layer": svcca_val,
+
+                # drift / layer comparison
+                "kl_next_layer_mean": kl_mean,
+                "kl_next_layer_seq": kl_seq,
+                "tvd_mean": tvd_mean,
+                "tvd_seq": tvd_seq,
+                "nwd": nwd_val,
+                "topk_jaccard_mean": jacc_mean,
+                "topk_kendall_tau_mean": tau_mean,
+                "topk_jaccard_seq": jacc_seq,
+                "topk_kendall_tau_seq": tau_seq,
+
+                # stability
+                "stability_top1_seq": stability_top1[-1] if len(stability_top1) else [],
+                "stability_topk_seq": stability_topk[-1] if len(stability_topk) else [],
+
+                # --- RAW DATA for carry-over safe metrics ---
+                "logits": logits_cur,                # [S,V] CPU tensor
+                "input_ids": input_ids_seq_trim_cpu, # [S] CPU tensor
+                "target_ids": tgt_ids[:valid_len],   # [S] CPU tensor
+                "vocab_size": getattr(wrapper.tokenizer, "vocab_size", None),
             }
 
             if save_layer_probs:
-                row["layer_probs"] = probs_tensor.detach().cpu().tolist() if probs_tensor.numel() > 0 else []
+                row["probs_seq"] = probs_cur[:valid_len].detach().cpu().numpy()
 
             rows.append(row)
 
-
-        # --- Divergence metrics ---
-        seq_len_layer = int(input_ids_seq_trim.numel() if isinstance(input_ids_seq_trim, torch.Tensor) else len(input_ids_seq_trim))
-
-        # helper to create NaN vector of desired length
-        def _nan_vec(n):
-            return np.full(n, np.nan, dtype=float)
-
-        if len(all_preds) == 0:
-            # no preds collected -> return shaped empty arrays
-            all_preds_arr = np.zeros((num_layers, 0), dtype=int)
-            all_topk_preds_arr = np.zeros((num_layers, 0, topk), dtype=int)
-            tgt_np_top1 = np.zeros((0,), dtype=int)
-            tgt_np_topk = np.zeros((0,), dtype=int)
-        else:
-            # Convert preds list to numpy (preserve order)
-            preds_np_list = []
-            for p in all_preds:
-                if isinstance(p, torch.Tensor):
-                    preds_np_list.append(p.detach().cpu().numpy())
-                else:
-                    preds_np_list.append(np.asarray(p))
-
-            # Convert topk list to numpy
-            topk_np_list = []
-            for tk in all_topk_preds:
-                if isinstance(tk, torch.Tensor):
-                    topk_np_list.append(tk.detach().cpu().numpy())
-                else:
-                    topk_np_list.append(np.asarray(tk))
-
-            # Convert target IDs to numpy (input_ids_seq_trim might be tensor or ndarray)
-            if isinstance(input_ids_seq_trim, torch.Tensor):
-                tgt_full = input_ids_seq_trim.detach().cpu().numpy()
-            else:
-                tgt_full = np.asarray(input_ids_seq_trim)
-
-            # --- Top-1 alignment ---
-            lens_top1 = [arr.shape[0] for arr in preds_np_list]
-            min_len_top1 = int(min(lens_top1 + [tgt_full.shape[0]]))
-            if min_len_top1 == 0:
-                all_preds_arr = np.zeros((num_layers, 0), dtype=int)
-                tgt_np_top1 = np.zeros((0,), dtype=int)
-            else:
-                all_preds_arr = np.stack([arr[:min_len_top1].astype(int) for arr in preds_np_list], axis=0)  # [L, min_len_top1]
-                tgt_np_top1 = tgt_full[:min_len_top1].astype(int)
-
-            # --- Top-k alignment (keep indices shape [L, min_len_topk, k]) ---
-            lens_topk = [arr.shape[0] for arr in topk_np_list]
-            min_len_topk = int(min(lens_topk + [tgt_full.shape[0]]))
-            if min_len_topk == 0:
-                all_topk_preds_arr = np.zeros((num_layers, 0, topk), dtype=int)
-                tgt_np_topk = np.zeros((0,), dtype=int)
-            else:
-                all_topk_preds_arr = np.stack([arr[:min_len_topk].astype(int) for arr in topk_np_list], axis=0)  # [L, min_len_topk, k]
-                tgt_np_topk = tgt_full[:min_len_topk].astype(int)
-
-        # wrapper to safely call divergence metric functions and pad/trim to seq_len_layer
-        """def _safe_div_metric(metric_func, arr_np, tgt_np):
-            try:
-                out = metric_func(arr_np, tgt_np, tgt_np)
-                if out is None:
-                    return _nan_vec(seq_len_layer)
-                out_np = np.asarray(out, dtype=float)
-                # pad/trim to seq_len_layer (so DataFrame fields have consistent length)
-                padded = _nan_vec(seq_len_layer)
-                copy_len = min(out_np.shape[0], seq_len_layer)
-                if copy_len > 0:
-                    padded[:copy_len] = out_np[:copy_len]
-                return padded
-            except Exception:
-                return _nan_vec(seq_len_layer)"""
-        # wrapper to safely call divergence metric functions and pad/trim to seq_len_layer
-        def _safe_div_metric(metric_func, arr_np, input_ids_np, target_ids_np):
-            try:
-                out = metric_func(arr_np, input_ids_np, target_ids_np)
-                if out is None:
-                    return _nan_vec(seq_len_layer)
-                out_np = np.asarray(out, dtype=float)
-                # pad/trim to seq_len_layer (so DataFrame fields have consistent length)
-                padded = _nan_vec(seq_len_layer)
-                copy_len = min(out_np.shape[0], seq_len_layer)
-                if copy_len > 0:
-                    padded[:copy_len] = out_np[:copy_len]
-                return padded
-            except Exception:
-                return _nan_vec(seq_len_layer)
-
-
-        # compute divergence metrics (top1 uses all_preds_arr; topk uses all_topk_preds_arr)
-        #div_stab_top1 = _safe_div_metric(div_stability_top1, all_preds_arr, tgt_np_top1)
-        #div_acc_top1  = _safe_div_metric(div_accuracy_top1,  all_preds_arr, tgt_np_top1)
-        #div_stab_topk = _safe_div_metric(div_stability_topk, all_topk_preds_arr, tgt_np_topk)
-        #div_acc_topk  = _safe_div_metric(div_accuracy_topk,  all_topk_preds_arr, tgt_np_topk)
-        div_stab_top1 = _safe_div_metric(div_stability_top1_safe, all_preds_arr, input_ids_seq_trim, tgt_np_top1)
-        div_acc_top1  = _safe_div_metric(div_accuracy_top1_safe,  all_preds_arr, input_ids_seq_trim, tgt_np_top1)
-        div_stab_topk = _safe_div_metric(div_stability_topk_safe, all_topk_preds_arr, input_ids_seq_trim, tgt_np_topk)
-        div_acc_topk  = _safe_div_metric(div_accuracy_topk_safe,  all_topk_preds_arr, input_ids_seq_trim, tgt_np_topk)
-
-
-        for r in rows:
-            if r["prompt_id"] == idx:
-                r["div_stability_top1"] = div_stab_top1.tolist()
-                r["div_stability_topk"] = div_stab_topk.tolist()
-                r["div_accuracy_top1"] = div_acc_top1.tolist()
-                r["div_accuracy_topk"] = div_acc_topk.tolist()
-
-    #return pd.DataFrame(rows)
-    rows_dict = {k: [row[k] for row in rows] for k in rows[0].keys()}
-    return rows_dict
+    return pd.DataFrame(rows)
 
 
 def run_logit_lens(
@@ -462,28 +468,31 @@ def run_logit_lens(
     prompts:List[str],
     model_name:str="model",
     dataset_name:str="dataset",
-    save_dir:str="logs/logit_lens_logs/batch_analysis",
-    A_acts=None,
-    B_acts=None,
+    save_dir:str="logs/logit_lens_logs/logit_lens_analysis",
     topk:int=TOPK,
+    eps=EPS,
     skip_input_layer:bool=True,
     include_final_norm:bool=True,
     save_layer_probs:bool=False,
+    proj_precision: Optional[str] = None,   # "fp16" | "fp32" | None
+    max_len: Optional[int] = 32
 ) -> None:
 
-    data = _run_logit_lens(
+    data_df = _run_logit_lens(
         wrapper=wrapper,
         prompts=prompts,
-        A_acts=A_acts,
-        B_acts=B_acts,
         topk=topk,
+        eps=eps,
         skip_input_layer=skip_input_layer,
         include_final_norm=include_final_norm,
-        save_layer_probs=save_layer_probs
+        save_layer_probs=save_layer_probs,
+        proj_precision=proj_precision,
+        max_len=max_len
     )
 
-    os.makedirs(save_dir, exist_ok=True)
+    # Convert DataFrame -> dict for saving
+    data_dict = {col: data_df[col].tolist() for col in data_df.columns}
 
-    pt_path= f"{save_dir}/{dataset_name}_{model_name}.pt"
-    #df.to_csv(csv_path, index=False)
-    torch.save(data, pt_path)
+    os.makedirs(save_dir, exist_ok=True)
+    pt_path = f"{save_dir}/{dataset_name}_{model_name}.pt"
+    torch.save(data_dict, pt_path)

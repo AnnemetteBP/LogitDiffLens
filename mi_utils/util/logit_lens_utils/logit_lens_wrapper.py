@@ -2,7 +2,9 @@ from typing import List, Optional, Any, Dict, Tuple, Union
 import torch
 import torch.nn as nn
 import numpy as np
+import pandas as pd
 import bitsandbytes as bnb
+from datasets import Dataset, DatasetDict, Column
 from ...util.module_utils import get_child_module_by_names
 from ...util.logit_lens_utils.model_device_handling import get_base_model, get_embedding_device
 from ...util.logit_lens_utils.make_layer_names import make_gpt2_layer_names, make_llama_layer_names
@@ -50,21 +52,20 @@ class LogitLensWrapper:
         force_include_output:bool=True,
         include_subblocks:bool=True,
         decoder_layer_names:Optional[List[str]]=None,
-        device:str="cuda"
+        device:str="cuda",
+        max_len: Optional[int ]= 32,
     ) -> None:
+        
         self.tokenizer = tokenizer
         self.device = device
         self.decoder_layer_names = decoder_layer_names or ["lm_head"]
-
-        # Detect architecture and quantization
+        self.max_len = max_len
         self.is_quantized = is_quantized_model(model)
         self.is_bitnet = is_bitnet_model(model)
         self.arch = detect_architecture(model)
 
-        # Move model to device if not quantized
         self.model = model if (self.is_quantized or self.is_bitnet) else model.to(device)
 
-        # Select layer/hook functions
         if self.arch == "gpt":
             self.make_layer_names_fn = make_gpt2_layer_names
             self.make_hooks_fn = make_gpt_lens_hooks
@@ -72,7 +73,6 @@ class LogitLensWrapper:
             self.make_layer_names_fn = make_llama_layer_names
             self.make_hooks_fn = make_llama_lens_hooks
 
-        # Generate layer names
         self.layer_names = self.make_layer_names_fn(
             model=self.model,
             block_step=block_step,
@@ -82,7 +82,6 @@ class LogitLensWrapper:
             decoder_layer_names=self.decoder_layer_names
         )
 
-        # Base model and transformer container
         self.base_model = get_base_model(self.model)
         self.module = get_child_module_by_names(
             self.base_model,
@@ -91,6 +90,7 @@ class LogitLensWrapper:
 
         self.handles = []
         self.hooks = {}
+
 
     # ----------------------------
     # Hook management
@@ -103,6 +103,7 @@ class LogitLensWrapper:
             decoder_layer_names=self.decoder_layer_names
         )
 
+
     def clear_hooks(self):
         if hasattr(self.model, "_layer_logits_handles"):
             for handle in self.model._layer_logits_handles.values():
@@ -112,28 +113,62 @@ class LogitLensWrapper:
             self.model._layer_logits.clear()
 
 
-    def tokenize_inputs(self, tokenizer, texts: list[str], model=None, add_special_tokens=True):
+    def extract_texts(
+        dataset_split, 
+        query_key: str = "question", 
+        answer_key: str = None, 
+        concat_query_answer: bool = False
+    ) -> list[str]:
         """
-        Tokenize a batch of strings into input IDs tensor.
-        Handles padding/truncation and moves to model device.
+        Extracts texts from a Hugging Face dataset split.
+        By default only returns query. If answer_key provided,
+        can return query+answer concatenated if concat_query_answer=True.
         """
+        queries = dataset_split[query_key]
+        if answer_key and concat_query_answer:
+            answers = dataset_split[answer_key]
+            texts = [f"{q} {a}" for q, a in zip(queries, answers)]
+        else:
+            texts = list(queries)  # just queries
+        return texts
+
+    
+    def tokenize_inputs(
+        self,
+        tokenizer,
+        texts: list[str],
+        model=None,
+        add_special_tokens=True,
+        max_len: int = 32,
+        move_to_device: bool = True
+    ):
+        """
+        Tokenize a batch of strings into a dict of tensors.
+        Handles padding/truncation and (optionally) moves to model device.
+        """
+        if isinstance(texts, Column):
+            texts = list(texts)
+        elif not (isinstance(texts, list) and all(isinstance(t, str) for t in texts)):
+            raise ValueError(f"Expected texts as List[str], got {type(texts)}")
+
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token or tokenizer.cls_token
 
-        # Tokenize batch
         inputs = tokenizer(
-            texts,                        # <-- batch of strings
-            return_tensors="pt",           # PyTorch tensor
-            padding=True,                  # pad sequences to max length
-            truncation=True,               # truncate sequences too long
-            add_special_tokens=add_special_tokens
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_len,
+            add_special_tokens=add_special_tokens,
         )
 
-        # Move tensors to model device
-        device = next(model.parameters()).device if model else torch.device("cpu")
-        input_ids = inputs["input_ids"].to(device)
+        if move_to_device and model is not None:
+            device = next(model.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
 
-        return input_ids  # shape: [batch_size, seq_len]
+        return inputs
+
 
     # ----------------------------
     # Forward (replace your forward method)
@@ -144,103 +179,74 @@ class LogitLensWrapper:
         project_to_logits: bool = True,
         return_hidden: bool = False,
         decoder: Optional[Any] = None,
+        keep_on_device: bool = True,
+        project_on_lm_head_dtype: bool = True,
+        force_dtype: Optional[torch.dtype] = None,
         add_bos: bool = False,
         add_eos: bool = True,
-        # new options:
-        keep_on_device: bool = True,   # don't move activations to CPU unless False
-        project_on_lm_head_dtype: bool = True  # run lm_head in its dtype/device
+        max_len: int = 32,
     ) -> Tuple[Any, Dict[str, torch.Tensor], List[str]]:
         """
         Forward that preserves dtype/device. Returns layer tensors on-device by default.
-
-        If project_to_logits (and lm_head exists), we will project by moving the
-        activation tensor to lm_head's device/dtype temporarily (not moving module).
         """
-        # ensure pad token
-        if self.tokenizer.pad_token is None:
-            if getattr(self.tokenizer, "eos_token", None) is not None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
+        inputs = self.tokenize_inputs(
+            tokenizer=self.tokenizer,
+            texts=texts,
+            model=self.model,
+            move_to_device=True, 
+        )
 
-        # Tokenize -> dict tensors
-        inputs = self.tokenizer(texts, return_tensors="pt", padding=True, truncation=True)
-        # note: do not change dtype here
-        # move tensors to model device
-        try:
-            model_device = next(self.model.parameters()).device
-        except StopIteration:
-            model_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        inputs = {k: v.to(model_device) for k, v in inputs.items()}
-
-        # register hooks (external)
+        model_device = next(self.model.parameters()).device
         self.add_hooks()
 
-        # run model
         self.model.eval()
         with torch.no_grad():
             outputs = self.model(**inputs, output_hidden_states=True)
 
-        # collect activations (choose the store used by your hooks)
         activations = {}
-        if hasattr(self.model, "_layer_logits") and getattr(self.model, "_layer_logits"):
+        if hasattr(self.model, "_layer_logits") and self.model._layer_logits:
             activations = dict(self.model._layer_logits)
-        elif hasattr(self.model, "_layer_hidden") and getattr(self.model, "_layer_hidden"):
+        elif hasattr(self.model, "_layer_hidden") and self.model._layer_hidden:
             activations = dict(self.model._layer_hidden)
-        elif hasattr(self, "layer_hidden_store") and getattr(self, "layer_hidden_store"):
+        elif hasattr(self, "layer_hidden_store") and self.layer_hidden_store:
             activations = dict(self.layer_hidden_store)
-        else:
-            return outputs, {}, []
 
-        layer_dict = {}
-        names = list(activations.keys())
-
+        layer_dict, names = {}, list(activations.keys())
         for lname in names:
             h = activations[lname]
-            # ensure tensor
             if not isinstance(h, torch.Tensor):
                 try:
                     h = torch.tensor(h, device=model_device)
                 except Exception:
-                    # leave as-is if conversion fails
                     layer_dict[lname] = h
                     continue
 
-            # if user asked raw hidden or not projecting
             if return_hidden or not project_to_logits:
-                layer_dict[lname] = h if keep_on_device else h.detach().cpu()
-                continue
+                out = h
+            elif decoder is not None:
+                out = decoder(h)
+            else:
+                lm_head = getattr(self.model, "lm_head", None)
+                hidden_size = getattr(self.model.config, "hidden_size", getattr(self.model.config, "n_embd", None))
+                if lm_head and hidden_size and h.shape[-1] == hidden_size:
+                    try:
+                        lm_dev = next(lm_head.parameters()).device
+                        lm_dtype = next(lm_head.parameters()).dtype if project_on_lm_head_dtype else h.dtype
+                        h_proj = h.to(lm_dev, dtype=lm_dtype, copy=False)
+                        out = lm_head(h_proj)
+                    except Exception:
+                        out = h  
+                else:
+                    out = h
 
-            # project via decoder or lm_head
-            if decoder is not None:
-                proj = decoder(h)  # assume decoder handles dtype/device
-                layer_dict[lname] = proj if keep_on_device else proj.detach().cpu()
-                continue
-
-            lm_head = getattr(self.model, "lm_head", None)
-            hidden_size = getattr(self.model.config, "hidden_size", getattr(self.model.config, "n_embd", None))
-            if lm_head is None or hidden_size is None or h.shape[-1] != hidden_size:
-                # cannot project -> return hidden
-                layer_dict[lname] = h if keep_on_device else h.detach().cpu()
-                continue
-
-            # Project on lm_head device/dtype by moving ACTIVATION (NOT the module)
-            try:
-                lm_dev = next(lm_head.parameters()).device
-                lm_dtype = next(lm_head.parameters()).dtype if project_on_lm_head_dtype else h.dtype
-
-                # temporary tensor move & dtype conversion
-                h_for_proj = h.to(device=lm_dev, dtype=lm_dtype, copy=False)
-                with torch.no_grad():
-                    projected = lm_head(h_for_proj)  # result on lm_dev and lm_dtype
-                # keep projected as tensor on device OR move to cpu based on keep_on_device
-                layer_dict[lname] = projected if keep_on_device else projected.detach().cpu()
-            except Exception:
-                # fallback: try to run lm_head on the model device (may cast types)
-                try:
-                    projected = lm_head(h.to(lm_head.weight.device))
-                    layer_dict[lname] = projected if keep_on_device else projected.detach().cpu()
-                except Exception:
-                    # final fallback: return hidden
-                    layer_dict[lname] = h if keep_on_device else h.detach().cpu()
+            # device/dtype control
+            if keep_on_device:
+                layer_dict[lname] = out
+            else:
+                out = out.detach().cpu()
+                if force_dtype is not None:
+                    out = out.to(force_dtype)
+                layer_dict[lname] = out
 
         return outputs, layer_dict, names
 

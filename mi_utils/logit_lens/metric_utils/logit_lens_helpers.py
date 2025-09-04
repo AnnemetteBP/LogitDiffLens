@@ -30,9 +30,14 @@ def save_degradation_results(
     print(f"Saved degradation results to {save_path}")
 
 
-def load_results_from_pt(results):
-    data = torch.load(results)
-    return data
+def load_results_from_pt(results) -> pd.DataFrame:
+    # Only do this if you trust the source of the file
+    data = torch.load(
+        results,
+        weights_only=False  # allow full unpickling
+    )
+    df = pd.DataFrame(data)
+    return df
 
 def save_results_to_csv(results:dict, filename:str):
     """
@@ -84,10 +89,20 @@ def extract_activations(wrapper: LogitLensWrapper, prompts: List[str], return_nu
             stacked[i, :L, :] = s
             mask[i, :L] = True
 
-        if return_numpy:
+        """if return_numpy:
             fp[lname] = {"hidden": stacked.detach().cpu().numpy(), "mask": mask.detach().cpu().numpy()}
         else:
-            fp[lname] = {"hidden": stacked, "mask": mask}
+            fp[lname] = {"hidden": stacked, "mask": mask}"""
+        if return_numpy:
+            fp[lname] = {
+                "hidden": stacked.detach().to(torch.float32).cpu().numpy(),  # always FP32
+                "mask": mask.detach().cpu().numpy()
+            }
+        else:
+            fp[lname] = {
+                "hidden": stacked.detach().to(torch.float32),  # always FP32
+                "mask": mask
+            }
 
     return fp
 
