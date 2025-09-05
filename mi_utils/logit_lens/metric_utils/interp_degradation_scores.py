@@ -243,3 +243,12 @@ def degradation_score(results:dict) -> tuple[dict,float]:
 
     overall_score = float(np.nanmean(list(section_scores.values())))
     return section_scores, overall_score
+
+"""
+hf100b_unsafe_results = analyze_UNSAFE_degradation(hf_wrapper, texts, top_k=5, decoder=None)
+
+hf100b_section_scores, hf100b_overall_score = degradation_score(hf100b_unsafe_results)
+
+print("Section scores:", hf100b_section_scores)
+print("Overall interpretability score:", hf100b_overall_score)
+"""

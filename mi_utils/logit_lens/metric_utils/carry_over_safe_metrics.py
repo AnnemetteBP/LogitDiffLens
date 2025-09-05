@@ -2,7 +2,7 @@ import re
 import math
 import torch
 import numpy as np
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 
 
@@ -11,78 +11,87 @@ EPS = 1e-8
 # -----------------------------------------------------------------------------
 # Core vectorized metric computation (expects layers_tensor: [L, S, V])
 # -----------------------------------------------------------------------------
-def compute_carry_over_safe_with_embedding_vectorized(layers_tensor:torch.Tensor,
-                                                      input_ids:torch.Tensor,
-                                                      target_ids:torch.Tensor,
-                                                      topk:int=TOPK):
-
+def compute_carry_over_safe_with_embedding_vectorized(
+    layers_tensor: torch.Tensor,
+    input_ids: torch.Tensor,
+    target_ids: torch.Tensor,
+    topk: int = TOPK,
+    pad_token_id: Optional[int] = 0
+):
     L, S, V = layers_tensor.shape
     device = layers_tensor.device
+    dtype = layers_tensor.dtype
 
     target_b = target_ids.to(device).unsqueeze(0)  # [1,S]
     input_b = input_ids.to(device).unsqueeze(0)    # [1,S]
+    
+    # ----------------- Padding mask -----------------
+    pad_mask_b = (input_b != pad_token_id)
 
     # ---------------- Top-1 Predictions ----------------
     top1_preds = layers_tensor.argmax(dim=-1)  # [L,S]
-    top1_valid = (top1_preds == target_b) & (top1_preds != input_b)
+    top1_valid = (top1_preds == target_b) & (top1_preds != input_b) & pad_mask_b
 
     # ---------------- Top-K Predictions ----------------
     k_eff = min(topk, V)
     topk_inds = layers_tensor.topk(k_eff, dim=-1).indices  # [L,S,k]
-    topk_valid = ((topk_inds == target_b.unsqueeze(-1)).any(-1)) & (target_b != input_b)
+    topk_valid = ((topk_inds == target_b.unsqueeze(-1)).any(-1)) & (target_b != input_b) & pad_mask_b
 
     # ---------------- Accuracy ----------------
-    acc_top1 = top1_valid.any(dim=0).float()  # [S]
-    acc_topk = topk_valid.any(dim=0).float()  # [S]
+    acc_top1 = top1_valid.any(dim=0).to(dtype)
+    acc_topk = topk_valid.any(dim=0).to(dtype)
 
-    # ---------------- Persistency (old stability) ----------------
-    # compare layer l vs l-1 for same token, ignore carry-over
-    persistency_top1 = ((top1_preds[1:] == top1_preds[:-1]) & (top1_preds[1:] != input_b)).float().mean(dim=0)
-    persistency_topk = ((topk_inds[1:] == topk_inds[:-1]).all(dim=-1) & (target_b != input_b)).float().mean(dim=0)
+    # ---------------- Persistency ----------------
+    persistency_top1 = ((top1_preds[1:] == top1_preds[:-1]) & (top1_preds[1:] != input_b) & pad_mask_b[1:]).to(dtype).mean(dim=0)
+    persistency_topk = ((topk_inds[1:] == topk_inds[:-1]).all(dim=-1) & (target_b != input_b) & pad_mask_b[1:]).to(dtype).mean(dim=0)
 
     # ---------------- Consistency ----------------
-    # first correct occurrence
     cum_top1 = top1_valid.cumsum(dim=0) > 0
     prev_top1 = torch.cat([torch.zeros((1, S), dtype=torch.bool, device=device), cum_top1[:-1]], dim=0)
     first_top1_mask = top1_valid & (~prev_top1)
     exists_top1 = first_top1_mask.any(dim=0)
-    first_top1_idx = torch.where(exists_top1,
-                                 first_top1_mask.float().argmax(dim=0).long(),
-                                 torch.full((S,), -1, dtype=torch.long, device=device))
+    first_top1_idx = torch.where(
+        exists_top1,
+        first_top1_mask.to(dtype).argmax(dim=0).long(),
+        torch.full((S,), -1, dtype=torch.long, device=device)
+    )
 
     cum_topk = topk_valid.cumsum(dim=0) > 0
     prev_topk = torch.cat([torch.zeros((1, S), dtype=torch.bool, device=device), cum_topk[:-1]], dim=0)
     first_topk_mask = topk_valid & (~prev_topk)
     exists_topk = first_topk_mask.any(dim=0)
-    first_topk_idx = torch.where(exists_topk,
-                                 first_topk_mask.float().argmax(dim=0).long(),
-                                 torch.full((S,), -1, dtype=torch.long, device=device))
+    first_topk_idx = torch.where(
+        exists_topk,
+        first_topk_mask.to(dtype).argmax(dim=0).long(),
+        torch.full((S,), -1, dtype=torch.long, device=device)
+    )
 
-    # Consistency = fraction of remaining layers after first correct where prediction stays valid
-    suf_top1_counts = top1_valid.flip(0).cumsum(dim=0).flip(0).float()
-    suf_topk_counts = topk_valid.flip(0).cumsum(dim=0).flip(0).float()
+    # Consistency
+    suf_top1_counts = top1_valid.flip(0).cumsum(dim=0).flip(0).to(dtype)
+    suf_topk_counts = topk_valid.flip(0).cumsum(dim=0).flip(0).to(dtype)
 
-    consistency_top1 = torch.zeros(S, device=device)
+    consistency_top1 = torch.zeros(S, dtype=dtype, device=device)
     mask1 = first_top1_idx >= 0
     if mask1.any():
         idxs = first_top1_idx[mask1]
         s_idx = mask1.nonzero(as_tuple=True)[0]
-        consistency_top1[mask1] = suf_top1_counts[idxs, s_idx] / (L - idxs).float()
+        consistency_top1[mask1] = suf_top1_counts[idxs, s_idx] / (L - idxs).to(dtype)
 
-    consistency_topk = torch.zeros(S, device=device)
+    consistency_topk = torch.zeros(S, dtype=dtype, device=device)
     maskk = first_topk_idx >= 0
     if maskk.any():
         idxs = first_topk_idx[maskk]
         s_idx = maskk.nonzero(as_tuple=True)[0]
-        consistency_topk[maskk] = suf_topk_counts[idxs, s_idx] / (L - idxs).float()
+        consistency_topk[maskk] = suf_topk_counts[idxs, s_idx] / (L - idxs).to(dtype)
 
-    # ---------------- Earliness / First-layer-correct ----------------
+    # ---------------- Earliness ----------------
     earliness_top1 = torch.where(first_top1_idx >= 0,
-                                 1.0 - first_top1_idx.float() / (L - 1),
-                                 torch.zeros(S, device=device))
+                                 1.0 - first_top1_idx.to(dtype) / (L - 1),
+                                 torch.zeros(S, dtype=dtype, device=device))
     earliness_topk = torch.where(first_topk_idx >= 0,
-                                 1.0 - first_topk_idx.float() / (L - 1),
-                                 torch.zeros(S, device=device))
+                                 1.0 - first_topk_idx.to(dtype) / (L - 1),
+                                 torch.zeros(S, dtype=dtype, device=device))
+
 
     # ---------------- Aggregate scalars ----------------
     out = {

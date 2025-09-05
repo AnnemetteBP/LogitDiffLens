@@ -24,10 +24,21 @@ TOPK = 5
 # ----------------------------
 # Helper Functions 
 # ----------------------------
-def safe_entropy(probs: torch.Tensor, eps:float = EPS) -> torch.Tensor:
-    probs = probs.float().clamp(min=eps, max=1.0)
-    log_probs = torch.log(probs)
-    ent = -(probs * log_probs).sum(dim=-1)
+def safe_entropy(probs: torch.Tensor, eps: float = EPS) -> torch.Tensor:
+    """
+    Compute entropy safely for float16 or float32 probabilities.
+    probs: [*, V] tensor, can be float16 or float32
+    eps: minimum probability
+    """
+    # Cast to float32 for safe log computation
+    probs_f32 = probs.to(torch.float32)
+
+    # Clamp small probabilities
+    probs_f32 = probs_f32.clamp(min=eps, max=1.0)
+
+    log_probs = torch.log(probs_f32)
+    ent = -(probs_f32 * log_probs).sum(dim=-1)
+
     return ent
 
 # -----------------------
@@ -44,21 +55,56 @@ def safe_tensor(t: torch.Tensor, eps: float = EPS, target_dtype: Optional[torch.
     if t.dtype != dtype:
         t = t.to(dtype)
 
+    # NaN / inf protection
     t = torch.nan_to_num(t, nan=-1e9, posinf=1e9, neginf=-1e9)
-    t = torch.clamp(t, min=-1e5, max=1e5)
+
+    # Clamp safely based on dtype
+    if dtype == torch.float16:
+        max_val = 60000.0  
+        min_val = -60000.0
+    elif dtype == torch.float32:
+        max_val = 1e5
+        min_val = -1e5
+    else:
+        max_val = 1e5
+        min_val = -1e5
+
+    t = torch.clamp(t, min=min_val, max=max_val)
 
     if for_log:
         t = t.clamp_min(eps)
+
     return t
-    
+
+def safe_cast_logits(tensor: torch.Tensor, target_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    dtype = target_dtype or (tensor.dtype if tensor.dtype in [torch.float16, torch.float32] else torch.float32)
+    if tensor.dtype != dtype:
+        tensor = tensor.to(dtype)
+
+    # NaN / inf protection
+    tensor = torch.nan_to_num(tensor, nan=-1e9, posinf=1e9, neginf=-1e9)
+
+    # Clamp safely based on dtype max
+    if dtype == torch.float16:
+        max_val = 60000.0  
+        min_val = -60000.0
+    elif dtype == torch.float32:
+        max_val = 1e5
+        min_val = -1e5
+    else:
+        max_val = 1e5
+        min_val = -1e5
+
+    tensor = torch.clamp(tensor, min=min_val, max=max_val)
+    return tensor
+
 
 def safe_softmax(logits: torch.Tensor, dim=-1, eps=EPS) -> torch.Tensor:
-    logits_max = logits.max(dim=dim, keepdim=True).values
-    exp_logits = torch.exp(logits - logits_max)
+    max_logits = logits.max(dim=dim, keepdim=True).values
+    exp_logits = torch.exp(logits - max_logits)
     sum_exp = exp_logits.sum(dim=dim, keepdim=True)
     probs = exp_logits / (sum_exp + eps)
     return probs.clamp(min=eps, max=1.0)
-
 
 
 def _run_logit_lens(
@@ -66,7 +112,7 @@ def _run_logit_lens(
     prompts: list[str],
     add_eos: bool = True,
     topk: int = TOPK,
-    eps=EPS,
+    eps = EPS,
     skip_input_layer: bool = True,
     include_final_norm: bool = True,
     save_layer_probs: bool = False,
@@ -79,15 +125,13 @@ def _run_logit_lens(
     wrapper.model.eval()
     device = get_embedding_device(wrapper.model)
 
-
+    # -----------------------
+    # Helpers
+    # -----------------------
     def _to_analysis_dtype(t: torch.Tensor) -> torch.dtype:
         if proj_precision is None:
             return t.dtype
-        if proj_precision.lower() == "fp16":
-            return torch.float16
-        if proj_precision.lower() == "fp32":
-            return torch.float32
-        return t.dtype
+        return torch.float16 if proj_precision.lower() == "fp16" else torch.float32
 
     # -----------------------
     # Forward / stack logits
@@ -100,10 +144,11 @@ def _run_logit_lens(
         keep_on_device=True,
         max_len=max_len
     )
-
     layer_logits_list, layer_names = wrapper.stack_layer_logits(layer_dict, keep_on_device=True, filter_layers=False)
 
+    # -----------------------
     # Filter layers
+    # -----------------------
     valid_layer_names, valid_layer_logits = [], []
     for lname, logits in zip(layer_names, layer_logits_list):
         lname_lower = lname.lower()
@@ -117,7 +162,7 @@ def _run_logit_lens(
     if len(valid_layer_logits) == 0:
         return pd.DataFrame([])
 
-    batch_size, seq_len = valid_layer_logits[0].shape[0], valid_layer_logits[0].shape[1]
+    batch_size, seq_len = valid_layer_logits[0].shape[:2]
     vocab_size = getattr(wrapper.tokenizer, "vocab_size", None)
 
     # -----------------------
@@ -126,12 +171,16 @@ def _run_logit_lens(
     det_logits_cpu, det_probs_cpu = [], []
     for logits in valid_layer_logits:
         adtype = _to_analysis_dtype(logits)
-        l_cpu = safe_tensor(logits.detach().to("cpu"), target_dtype=adtype)
+        l_cpu = safe_cast_logits(logits.detach().to("cpu"), target_dtype=adtype)
+
+        # Compute softmax safely
         probs = safe_softmax(l_cpu, dim=-1)
-        if adtype != torch.float32:
+        if probs.dtype != adtype:
             probs = probs.to(adtype)
+
         det_logits_cpu.append(l_cpu)
         det_probs_cpu.append(probs.contiguous())
+
 
     # -----------------------
     # Targets
@@ -153,49 +202,42 @@ def _run_logit_lens(
             logits_cur = det_logits_cpu[l][idx][:max_valid_len]
             probs_cur = det_probs_cpu[l][idx][:max_valid_len]
 
-            # Per-token mean (preserve dtype)
-            logit_mean, logit_std, logit_var = logits_cur.mean(dim=-1), logits_cur.std(dim=-1), logits_cur.var(dim=-1)
-            prob_mean, prob_std, prob_var = probs_cur.mean(dim=-1), probs_cur.std(dim=-1), probs_cur.var(dim=-1)
-
-            # Predictions & Top-K
+            # ------------------- Predictions -------------------
             preds_seq_tensor = probs_cur.argmax(dim=-1)
             k_eff = min(topk, probs_cur.shape[-1])
             topk_idx_tensor = torch.topk(probs_cur, k=k_eff, dim=-1).indices
-            topk_preds_seq = topk_idx_tensor.detach().cpu().numpy().astype(np.int64)
 
             valid_len = min(max_valid_len, preds_seq_tensor.shape[0])
-            if valid_len > 0:
-                preds_seq = preds_seq_tensor[:valid_len].detach().cpu().numpy().astype(np.int64)
-                tgt_np = tgt_ids[:valid_len].numpy().astype(np.int64)
-                correct_1_seq = (preds_seq == tgt_np).astype(float).tolist()
-                tk = topk_idx_tensor[:valid_len].cpu().numpy().astype(np.int64)
-                correct_topk_seq = [float(tgt_np[i] in tk[i]) for i in range(valid_len)]
-            else:
-                preds_seq = np.array([], dtype=np.int64)
-                tgt_np = np.array([], dtype=np.int64)
-                correct_1_seq, correct_topk_seq = [], []
+            preds_seq = preds_seq_tensor[:valid_len].detach().cpu().numpy().astype(np.int64)
+            tgt_np = tgt_ids[:valid_len].numpy().astype(np.int64)
+            topk_preds_seq = topk_idx_tensor[:valid_len].detach().cpu().numpy().astype(np.int64)
+            correct_1_seq = (preds_seq == tgt_np).astype(float).tolist()
+            correct_topk_seq = [float(tgt_np[i] in topk_preds_seq[i]) for i in range(valid_len)]
 
-            # Layer-wise top1/topk mean
-            if valid_len > 0:
-                top1_probs = probs_cur.gather(-1, preds_seq_tensor.unsqueeze(-1)).squeeze(-1)[:valid_len]
-                top1_mean_prob = float(top1_probs.mean().item()) if top1_probs.numel() else None
-                topk_probs = torch.topk(probs_cur, k=k_eff, dim=-1).values[:valid_len]
-                topk_mean_prob = float(topk_probs.mean().item()) if topk_probs.numel() else None
-            else:
-                top1_mean_prob, topk_mean_prob = None, None
+            # ------------------- Probabilities / logits stats -------------------
+            logit_mean = logits_cur.mean(dim=-1)
+            logit_std = logits_cur.std(dim=-1)
+            logit_var = logits_cur.var(dim=-1)
+            prob_mean = probs_cur.mean(dim=-1)
+            prob_std = probs_cur.std(dim=-1)
+            prob_var = probs_cur.var(dim=-1)
+            top1_probs = probs_cur.gather(-1, preds_seq_tensor.unsqueeze(-1)).squeeze(-1)
+            top1_mean_prob = float(top1_probs.mean().item()) if top1_probs.numel() else None
+            topk_probs = torch.topk(probs_cur, k=k_eff, dim=-1).values
+            topk_mean_prob = float(topk_probs.mean().item()) if topk_probs.numel() else None
 
-            # Entropy / normalized entropy
+            # ------------------- Entropy -------------------
             p_safe = safe_tensor(probs_cur, eps=eps, target_dtype=probs_cur.dtype, for_log=True)
             ent_seq = -(p_safe * p_safe.log()).sum(dim=-1).cpu().numpy()
             normalized_ent_seq = ent_seq / math.log(vocab_size) if vocab_size and vocab_size > 1 else ent_seq / np.log(np.e)
 
-            # ECE
+            # ------------------- ECE -------------------
             try:
                 ece_val = compute_ece(p_safe.cpu().numpy(), tgt_np) if valid_len > 0 else None
             except Exception:
                 ece_val = None
 
-            # N-grams & repetition
+            # ------------------- N-grams & repetition -------------------
             ngram_correct = {n: compute_ngram_matches(preds_seq, tgt_np, n) if valid_len >= n else [] for n in (2, 3)}
             try:
                 repetition_ratio = float(np.mean(preds_seq[1:] == preds_seq[:-1])) if valid_len > 1 else np.nan
