@@ -16,7 +16,7 @@ from .metric_utils.logit_lens_helpers import(
 # ----------------------------
 # Reusable Inputs
 # ----------------------------
-EPS = 1e-12
+EPS = 1e-8 
 TOPK = 5
 
 

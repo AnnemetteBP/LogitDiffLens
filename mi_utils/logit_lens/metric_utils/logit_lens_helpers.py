@@ -336,3 +336,92 @@ def safe_for_bfloat16(t: torch.Tensor) -> torch.Tensor:
     if isinstance(t, torch.Tensor) and t.dtype == torch.bfloat16:
         return t.float()
     return t
+
+def safe_kl_per_token(p: np.ndarray, q: np.ndarray, eps: float = EPS) -> np.ndarray:
+    """
+    Safe KL divergence per token position.
+    Clips probabilities, handles NaNs/Infs, returns np.nan for invalid positions.
+
+    Args:
+        p: [seq_len, vocab_size] predicted probabilities for current layer
+        q: [seq_len, vocab_size] predicted probabilities for next layer
+        eps: small value to prevent log(0)
+
+    Returns:
+        kl_seq: [seq_len] KL divergence per token
+    """
+    kl_seq = []
+    for i in range(p.shape[0]):
+        pi, qi = p[i], q[i]
+
+        # Clip to avoid log(0) and handle NaNs/Infs
+        pi_clamped = np.clip(np.nan_to_num(pi, nan=0.0, posinf=0.0, neginf=0.0), eps, 1.0)
+        qi_clamped = np.clip(np.nan_to_num(qi, nan=0.0, posinf=0.0, neginf=0.0), eps, 1.0)
+
+        # Only compute KL if both vectors are valid
+        if np.all(np.isfinite(pi_clamped)) and np.all(np.isfinite(qi_clamped)):
+            kl_val = np.sum(rel_entr(pi_clamped, qi_clamped))
+        else:
+            kl_val = np.nan
+
+        kl_seq.append(kl_val)
+
+    return np.array(kl_seq, dtype=float)
+
+def safe_nwd_probs(p: np.ndarray, q: np.ndarray, eps: float = EPS) -> float:
+    """
+    Normalized weighted distance (1 - cosine similarity), safely handling NaNs/Infs.
+    """
+    p_safe = np.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
+    q_safe = np.nan_to_num(q, nan=0.0, posinf=0.0, neginf=0.0)
+
+    norm_p = np.linalg.norm(p_safe)
+    norm_q = np.linalg.norm(q_safe)
+
+    if norm_p < eps or norm_q < eps:
+        return np.nan
+
+    sim = np.dot(p_safe, q_safe) / (norm_p * norm_q)
+    return 1.0 - sim
+
+
+def safe_nwd(probs_current_mean, probs_next_mean):
+    """
+    Compute NWD safely. Returns 0.0 if undefined.
+    """
+    try:
+        if probs_current_mean is None or probs_next_mean is None:
+            return 0.0
+        nwd_val = safe_nwd_probs(probs_current_mean, probs_next_mean)
+        return float(nwd_val) if nwd_val is not None else 0.0
+    except Exception:
+        return 0.0
+
+
+def safe_tvd(p: np.ndarray, q: np.ndarray, eps: float = EPS) -> np.ndarray:
+    """
+    Safe total variation distance per token.
+    Clips probabilities and handles NaNs/Infs.
+    """
+    tvd_seq = []
+    for i in range(p.shape[0]):
+        pi, qi = np.clip(np.nan_to_num(p[i], nan=0.0, posinf=1.0, neginf=0.0), eps, 1.0), \
+                 np.clip(np.nan_to_num(q[i], nan=0.0, posinf=1.0, neginf=0.0), eps, 1.0)
+        tvd_seq.append(0.5 * np.sum(np.abs(pi - qi)))
+    return np.array(tvd_seq, dtype=float)
+
+
+def safe_kl(probs_p: torch.Tensor, probs_q: torch.Tensor, eps:float = EPS) -> torch.Tensor:
+    p = probs_p.float().clamp(min=eps, max=1.0)
+    q = probs_q.float().clamp(min=eps, max=1.0)
+    return (p * (p.log() - q.log())).sum(dim=-1)
+
+
+def safe_metric(metric_func, *args, default=np.nan):
+    try:
+        val = metric_func(*args)
+        if val is None or (hasattr(val, '__len__') and len(val) == 0):
+            return default
+        return np.array(val, dtype=float)
+    except Exception:
+        return default

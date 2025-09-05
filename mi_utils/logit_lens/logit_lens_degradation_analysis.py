@@ -9,7 +9,7 @@ from ..util.logit_lens_utils.model_device_handling import get_base_model, get_em
 # ----------------------------
 # Reusable Inputs
 # ----------------------------
-EPS = 1e-12
+EPS = 1e-8 
 TOPK = 5
 
 

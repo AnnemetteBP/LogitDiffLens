@@ -7,6 +7,7 @@ from typing import List, Tuple
 
 
 TOPK = 5
+EPS = 1e-8 
 # -----------------------------------------------------------------------------
 # Core vectorized metric computation (expects layers_tensor: [L, S, V])
 # -----------------------------------------------------------------------------
