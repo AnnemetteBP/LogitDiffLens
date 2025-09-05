@@ -58,6 +58,14 @@ class LogitLensWrapper:
         
         self.tokenizer = tokenizer
         self.vocab_size = self.tokenizer.vocab_size
+
+        if self.tokenizer.pad_token is None:
+            if self.tokenizer.eos_token is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            else:
+                self.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+                self.model.resize_token_embeddings(len(self.tokenizer))
+
         self.device = device
         self.decoder_layer_names = decoder_layer_names or ["lm_head"]
         self.max_len = max_len
@@ -136,35 +144,37 @@ class LogitLensWrapper:
     
     def tokenize_inputs(
         self,
-        tokenizer,
-        texts: list[str],
-        model=None,
-        add_special_tokens=True,
+        texts: List[str],
+        add_special_tokens: bool = True,
+        add_bos: bool = False,
+        add_eos: bool = True,
         max_len: int = 32,
-        move_to_device: bool = True
+        move_to_device: bool = True,
     ):
-        """
-        Tokenize a batch of strings into a dict of tensors.
-        Handles padding/truncation and (optionally) moves to model device.
-        """
-        if isinstance(texts, Column):
-            texts = list(texts)
-        elif not (isinstance(texts, list) and all(isinstance(t, str) for t in texts)):
-            raise ValueError(f"Expected texts as List[str], got {type(texts)}")
+        tokenizer = self.tokenizer
+        model = self.model
 
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token or tokenizer.cls_token
+        # Handle BOS/EOS manually if requested
+        processed = []
+        for t in texts:
+            if add_bos and tokenizer.bos_token is not None and not t.startswith(tokenizer.bos_token):
+                t = tokenizer.bos_token + t
+            if add_eos and tokenizer.eos_token is not None and not t.endswith(tokenizer.eos_token):
+                t = t + tokenizer.eos_token
+            processed.append(t)
 
+        # Tokenize
         inputs = tokenizer(
-            texts,
+            processed,
             return_tensors="pt",
-            padding=True,
+            padding=True,   # safe now, pad_token guaranteed
             truncation=True,
             max_length=max_len,
             add_special_tokens=add_special_tokens,
         )
 
-        if move_to_device and model is not None:
+        # Move tensors to device
+        if move_to_device:
             device = next(model.parameters()).device
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
@@ -191,10 +201,11 @@ class LogitLensWrapper:
         Forward that preserves dtype/device. Returns layer tensors on-device by default.
         """
         inputs = self.tokenize_inputs(
-            tokenizer=self.tokenizer,
             texts=texts,
-            model=self.model,
-            move_to_device=True, 
+            add_bos=add_bos,
+            add_eos=add_eos,
+            max_len=max_len,
+            move_to_device=True,
         )
 
         model_device = next(self.model.parameters()).device

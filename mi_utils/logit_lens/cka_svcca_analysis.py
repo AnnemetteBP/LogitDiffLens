@@ -13,6 +13,22 @@ from .metric_utils.logit_lens_helpers import(
     align_activations
 )
 
+
+def save_fp_acts_to_pt(fp_acts, save_name:str) -> None:
+    fp_acts_to_save = {}
+    for lname, act in fp_acts.items():
+        fp_acts_to_save[lname] = {
+            "hidden": act["hidden"].detach().cpu(),
+            "mask": act["mask"].detach().cpu()
+        }
+
+    torch.save(fp_acts_to_save, f"logs/cka_svcca_acts/{save_name}.pt")
+
+def load_fp_acts(fp_acts_name:str):
+    fp_acts = torch.load(f"logs/cka_svcca_acts/{fp_acts_name}.pt")
+    return fp_acts
+
+
 # ----------------------------
 # Reusable Inputs
 # ----------------------------

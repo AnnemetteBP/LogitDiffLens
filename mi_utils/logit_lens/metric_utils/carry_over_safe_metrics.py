@@ -193,3 +193,67 @@ def get_carry_over_safe_with_embedding(saved_df, topk=5, prefix='layers.'):
         agg[k] = float(np.mean([results_per_prompt[pid][k] for pid in prompt_ids]))
 
     return {'per_prompt': results_per_prompt, 'mean': agg}
+
+
+def compute_carry_over_safe_partitioned(
+    saved_df,
+    topk: int = TOPK,
+    prefix: str = "layers.",
+    partitions: Optional[dict] = None
+):
+    """
+    saved_df: the DataFrame from your logit-lens run
+    topk: top-k for metrics
+    prefix: layer name prefix
+    partitions: optional dict {'early': (0, 0.25), 'mid': (0.25,0.5), ...} as fractions of total layers
+                if None, default 4 equal partitions are used
+
+    Returns: dict with per-prompt and per-partition averages
+    """
+    canonical_layers = canonical_layer_names_from_df(saved_df, prefix=prefix)
+    if len(canonical_layers) == 0:
+        raise ValueError("No canonical 'layers.N' names found in df")
+    num_layers = len(canonical_layers)
+
+    # default 4 partitions
+    if partitions is None:
+        partitions = {
+            "early": (0.0, 0.25),
+            "mid": (0.25, 0.5),
+            "late": (0.5, 0.75),
+            "last": (0.75, 1.0)
+        }
+
+    # build partition layer indices
+    partition_indices = {}
+    for name, (start_frac, end_frac) in partitions.items():
+        start_idx = int(start_frac * num_layers)
+        end_idx = int(end_frac * num_layers)
+        partition_indices[name] = list(range(start_idx, end_idx))
+
+    results_per_prompt = {}
+    prompt_ids = sorted(saved_df['prompt_id'].unique().tolist())
+
+    for pid in prompt_ids:
+        df_prompt = saved_df[saved_df['prompt_id'] == pid]
+        layers_tensor, input_ids, target_ids = prepare_layer_tensors_for_prompt(df_prompt, canonical_layers)
+
+        metrics_per_partition = {}
+        for pname, idxs in partition_indices.items():
+            if len(idxs) == 0:
+                continue
+            layers_sub = layers_tensor[idxs]  # [L_sub, S, V]
+            metrics = compute_carry_over_safe_with_embedding_vectorized(layers_sub, input_ids, target_ids, topk=topk)
+            metrics_per_partition[pname] = metrics
+
+        results_per_prompt[pid] = metrics_per_partition
+
+    # compute global mean per partition
+    all_partitions = partitions.keys()
+    agg = {pname: {} for pname in all_partitions}
+    for pname in all_partitions:
+        keys = list(next(iter(results_per_prompt.values()))[pname].keys())
+        for k in keys:
+            agg[pname][k] = float(np.mean([results_per_prompt[pid][pname][k] for pid in prompt_ids]))
+
+    return {"per_prompt": results_per_prompt, "per_partition_mean": agg}

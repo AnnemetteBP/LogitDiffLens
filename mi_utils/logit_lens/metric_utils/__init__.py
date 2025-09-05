@@ -9,6 +9,7 @@ from .interp_degradation_scores import (
 )
 from .carry_over_safe_metrics import (
     get_carry_over_safe_with_embedding,
+    compute_carry_over_safe_partitioned
 )
 
 from .logit_lens_helpers import(
@@ -56,5 +57,6 @@ __all__ = [
     'safe_for_bfloat16',
     'save_degradation_results',
     'load_results_from_pt',
-    'get_carry_over_safe_with_embedding'
+    'get_carry_over_safe_with_embedding',
+    'compute_carry_over_safe_partitioned'
 ]
