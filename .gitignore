@@ -4,3 +4,5 @@ logit-lens-env/
 Models/
 pdir/
 logs/
+figs/
+nbs/

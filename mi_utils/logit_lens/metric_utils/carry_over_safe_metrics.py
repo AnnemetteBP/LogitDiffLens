@@ -7,10 +7,18 @@ from typing import List, Tuple, Optional
 
 
 TOPK = 5
-EPS = 1e-8 
 # -----------------------------------------------------------------------------
 # Core vectorized metric computation (expects layers_tensor: [L, S, V])
 # -----------------------------------------------------------------------------
+# paste into mi_utils/logit_lens/metric_utils/carry_over_safe_metrics.py
+import re
+from typing import List, Optional, Union
+import numpy as np
+import torch
+import pandas as pd
+
+# Keep using module-level TOPK/EPS if present; functions accept topk param too.
+
 def compute_carry_over_safe_with_embedding_vectorized(
     layers_tensor: torch.Tensor,
     input_ids: torch.Tensor,
@@ -18,38 +26,70 @@ def compute_carry_over_safe_with_embedding_vectorized(
     topk: int = TOPK,
     pad_token_id: Optional[int] = 0
 ):
+    """
+    Vectorized carry-over-safe metrics on a stacked layers tensor.
+    layers_tensor: [L, S, V] (torch.Tensor, CPU or device)
+    input_ids: [S] (torch.Tensor)
+    target_ids: [S] (torch.Tensor)
+    Returns: dict of scalar metrics (same keys you had before)
+    """
+    # shapes & types
     L, S, V = layers_tensor.shape
     device = layers_tensor.device
     dtype = layers_tensor.dtype
 
+    # ensure 1D input/target on same device
     target_b = target_ids.to(device).unsqueeze(0)  # [1,S]
     input_b = input_ids.to(device).unsqueeze(0)    # [1,S]
-    
-    # ----------------- Padding mask -----------------
-    pad_mask_b = (input_b != pad_token_id)
+    pad_mask_b = (input_b != pad_token_id)         # [1,S]
 
-    # ---------------- Top-1 Predictions ----------------
+    # Expand to layer dimension so slices like [1:] make sense
+    if L > 1:
+        target_layer = target_b.repeat(L, 1)    # [L, S]
+        input_layer = input_b.repeat(L, 1)      # [L, S]
+        pad_mask_layer = pad_mask_b.repeat(L, 1)# [L, S]
+    else:
+        # L == 1; keep shapes consistent
+        target_layer = target_b.clone()
+        input_layer = input_b.clone()
+        pad_mask_layer = pad_mask_b.clone()
+
+    # ----------------- Top-1 / Top-K predictions -----------------
     top1_preds = layers_tensor.argmax(dim=-1)  # [L,S]
-    top1_valid = (top1_preds == target_b) & (top1_preds != input_b) & pad_mask_b
+    # top1_valid: whether predicted token equals target and not just copied from input & not pad
+    top1_valid = (top1_preds == target_layer) & (top1_preds != input_layer) & pad_mask_layer
 
-    # ---------------- Top-K Predictions ----------------
     k_eff = min(topk, V)
     topk_inds = layers_tensor.topk(k_eff, dim=-1).indices  # [L,S,k]
-    topk_valid = ((topk_inds == target_b.unsqueeze(-1)).any(-1)) & (target_b != input_b) & pad_mask_b
+    topk_valid = ((topk_inds == target_b.unsqueeze(-1)).any(-1)) & (target_layer != input_layer) & pad_mask_layer
 
     # ---------------- Accuracy ----------------
-    acc_top1 = top1_valid.any(dim=0).to(dtype)
-    acc_topk = topk_valid.any(dim=0).to(dtype)
+    acc_top1 = top1_valid.any(dim=0).to(dtype)   # [S]
+    acc_topk = topk_valid.any(dim=0).to(dtype)   # [S]
 
     # ---------------- Persistency ----------------
-    persistency_top1 = ((top1_preds[1:] == top1_preds[:-1]) & (top1_preds[1:] != input_b) & pad_mask_b[1:]).to(dtype).mean(dim=0)
-    persistency_topk = ((topk_inds[1:] == topk_inds[:-1]).all(dim=-1) & (target_b != input_b) & pad_mask_b[1:]).to(dtype).mean(dim=0)
+    if L > 1:
+        persistency_top1 = (
+            ((top1_preds[1:] == top1_preds[:-1]) & (top1_preds[1:] != input_layer[1:]) & pad_mask_layer[1:])
+            .to(dtype)
+            .mean(dim=0)
+        )
+        persistency_topk = (
+            ((topk_inds[1:] == topk_inds[:-1]).all(dim=-1) & (target_layer[1:] != input_layer[1:]) & pad_mask_layer[1:])
+            .to(dtype)
+            .mean(dim=0)
+        )
+    else:
+        # No temporal layers to compare -> zeros
+        persistency_top1 = torch.zeros(S, dtype=dtype, device=device)
+        persistency_topk = torch.zeros(S, dtype=dtype, device=device)
 
     # ---------------- Consistency ----------------
-    cum_top1 = top1_valid.cumsum(dim=0) > 0
+    cum_top1 = top1_valid.cumsum(dim=0) > 0                              # [L,S]
     prev_top1 = torch.cat([torch.zeros((1, S), dtype=torch.bool, device=device), cum_top1[:-1]], dim=0)
-    first_top1_mask = top1_valid & (~prev_top1)
-    exists_top1 = first_top1_mask.any(dim=0)
+    first_top1_mask = top1_valid & (~prev_top1)                           # [L,S]
+    exists_top1 = first_top1_mask.any(dim=0)                              # [S]
+    # Use argmax on boolean -> index of first True per column
     first_top1_idx = torch.where(
         exists_top1,
         first_top1_mask.to(dtype).argmax(dim=0).long(),
@@ -66,7 +106,7 @@ def compute_carry_over_safe_with_embedding_vectorized(
         torch.full((S,), -1, dtype=torch.long, device=device)
     )
 
-    # Consistency
+    # Consistency: suf_counts = number of valid positions from first occurrence onward
     suf_top1_counts = top1_valid.flip(0).cumsum(dim=0).flip(0).to(dtype)
     suf_topk_counts = topk_valid.flip(0).cumsum(dim=0).flip(0).to(dtype)
 
@@ -75,6 +115,7 @@ def compute_carry_over_safe_with_embedding_vectorized(
     if mask1.any():
         idxs = first_top1_idx[mask1]
         s_idx = mask1.nonzero(as_tuple=True)[0]
+        # gather counts: suf_top1_counts[idxs, s_idx]
         consistency_top1[mask1] = suf_top1_counts[idxs, s_idx] / (L - idxs).to(dtype)
 
     consistency_topk = torch.zeros(S, dtype=dtype, device=device)
@@ -85,15 +126,18 @@ def compute_carry_over_safe_with_embedding_vectorized(
         consistency_topk[maskk] = suf_topk_counts[idxs, s_idx] / (L - idxs).to(dtype)
 
     # ---------------- Earliness ----------------
-    earliness_top1 = torch.where(first_top1_idx >= 0,
-                                 1.0 - first_top1_idx.to(dtype) / (L - 1),
-                                 torch.zeros(S, dtype=dtype, device=device))
-    earliness_topk = torch.where(first_topk_idx >= 0,
-                                 1.0 - first_topk_idx.to(dtype) / (L - 1),
-                                 torch.zeros(S, dtype=dtype, device=device))
+    if L > 1:
+        earliness_top1 = torch.where(first_top1_idx >= 0,
+                                     1.0 - first_top1_idx.to(dtype) / (L - 1),
+                                     torch.zeros(S, dtype=dtype, device=device))
+        earliness_topk = torch.where(first_topk_idx >= 0,
+                                     1.0 - first_topk_idx.to(dtype) / (L - 1),
+                                     torch.zeros(S, dtype=dtype, device=device))
+    else:
+        earliness_top1 = torch.zeros(S, dtype=dtype, device=device)
+        earliness_topk = torch.zeros(S, dtype=dtype, device=device)
 
-
-    # ---------------- Aggregate scalars ----------------
+    # ---------------- Aggregate scalars (mean across positions) ----------------
     out = {
         'acc_top1_scalar': float(acc_top1.mean().item()),
         'acc_topk_scalar': float(acc_topk.mean().item()),
@@ -108,91 +152,166 @@ def compute_carry_over_safe_with_embedding_vectorized(
     return out
 
 
-# -----------------------------------------------------------------------------
-# Helpers to build layers_tensor from your saved DataFrame layout
-# -----------------------------------------------------------------------------
-def canonical_layer_names_from_df(df, prefix='layers.'):
-    """Return sorted canonical layer names e.g. ['layers.0', 'layers.1', ...] present in df."""
+# -------------------------------------------------------
+# Helpers to extract canonical layer names and build tensors
+# -------------------------------------------------------
+def canonical_layer_names_from_df(saved_df: Union[pd.DataFrame, list], prefix: str = '') -> List[str]:
+    """
+    Return sorted canonical layer names that start with given prefix.
+    Accepts either a DataFrame or a list-of-dicts (the result of your original `rows`).
+    Accepts names like 'layers.0.self_attn' when prefix='layers.' and will extract the numeric index.
+    """
+    # Normalize to DataFrame
+    if isinstance(saved_df, list):
+        df = pd.DataFrame(saved_df)
+    elif isinstance(saved_df, pd.DataFrame):
+        df = saved_df
+    else:
+        try:
+            df = pd.DataFrame(saved_df)
+        except Exception:
+            raise TypeError("saved_df must be a DataFrame or a list of dicts")
+
+    if 'layer_name' not in df.columns:
+        return []
+
     names = sorted(set(df['layer_name'].tolist()))
-    pattern = re.compile(r'^' + re.escape(prefix) + r'(\d+)$')
     matches = []
     for n in names:
-        m = pattern.match(n)
+        if not isinstance(n, str):
+            continue
+        if not n.startswith(prefix):
+            continue
+        # look for digits immediately after prefix
+        m = re.search(r'^' + re.escape(prefix) + r'(\d+)', n)
         if m:
             matches.append((int(m.group(1)), n))
+        else:
+            # fallback: include it but assign large index so it sorts after numeric ones
+            matches.append((10**6, n))
     matches.sort()
     return [n for _, n in matches]
 
 
-def prepare_layer_tensors_for_prompt(df_prompt, canonical_layers: List[str]):
+def prepare_layer_tensors_for_prompt(df_prompt: pd.DataFrame, canonical_layers: List[str]):
     """
-    df_prompt: DataFrame filtered for a single prompt_id with rows for many layer_names (one row per layer)
-    canonical_layers: list of layer names (in order) to include. Each row must have 'logits' as a torch Tensor [S,V],
-                     and at least one row must contain 'input_ids' and 'target_ids' tensors (we take from the first canonical layer).
-    Returns: layers_tensor [L, S, V], input_ids [S], target_ids [S]
+    df_prompt: DataFrame filtered for a single prompt_id with rows for many layer_names
+    canonical_layers: ordered list of layer names to include
+    Returns: layers_tensor [L, S, V] (torch.Tensor, CPU), input_ids [S] (torch.Tensor), target_ids [S] (torch.Tensor)
     """
-    rows_by_name = {row['layer_name']: row for _, row in df_prompt.iterrows()}
-    # Get input/target from the first canonical layer that exists
+    if not isinstance(df_prompt, pd.DataFrame):
+        df_prompt = pd.DataFrame(df_prompt)
+
+    # map name -> row (row as dict)
+    rows_by_name = {}
+    for _, r in df_prompt.iterrows():
+        rows_by_name[r['layer_name']] = r
+
+    # find a row to extract input/target ids from
+    ref_row = None
     for lname in canonical_layers:
         if lname in rows_by_name:
             ref_row = rows_by_name[lname]
-            input_ids = ref_row['input_ids']
-            target_ids = ref_row['target_ids']
             break
-    else:
+    if ref_row is None:
         raise ValueError("No canonical layer rows found to extract input/target ids.")
 
-    # Convert input/target to tensors if needed
-    if isinstance(input_ids, list) or isinstance(input_ids, np.ndarray):
-        input_ids = torch.tensor([int(x) for x in input_ids], dtype=torch.long)
-    if isinstance(target_ids, list) or isinstance(target_ids, np.ndarray):
-        target_ids = torch.tensor([int(x) for x in target_ids], dtype=torch.long)
+    input_ids = ref_row['input_ids']
+    target_ids = ref_row['target_ids']
+
+    # convert input/target to 1D torch tensors if needed
+    def to_1d_tensor(x):
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().long().flatten()
+        if isinstance(x, np.ndarray):
+            return torch.from_numpy(x).long().flatten()
+        if isinstance(x, (list, tuple)):
+            return torch.tensor([int(i) for i in x], dtype=torch.long)
+        # fallback
+        return torch.tensor([int(x)], dtype=torch.long)
+
+    input_ids_t = to_1d_tensor(input_ids)
+    target_ids_t = to_1d_tensor(target_ids)
 
     layer_tensors = []
     for lname in canonical_layers:
         if lname not in rows_by_name:
-            raise KeyError(f"Missing layer {lname} for prompt {df_prompt['prompt_id'].iloc[0]}")
+            raise KeyError(f"Missing layer {lname} for prompt {df_prompt.get('prompt_id', ['?'])[0]}")
         row = rows_by_name[lname]
         logits = row['logits']
-        # Ensure logits are torch.Tensor [S,V]
-        if not isinstance(logits, torch.Tensor):
-            # if it's a list-of-lists etc:
-            logits = torch.stack([torch.tensor(x, dtype=torch.float) if not isinstance(x, torch.Tensor) else x
-                                  for x in logits])
-        layer_tensors.append(logits.to(torch.float))  # keep on CPU to avoid GPU memory spikes
 
-    layers_tensor = torch.stack(layer_tensors, dim=0)  # [L, S, V]
-    return layers_tensor, torch.tensor(input_ids, dtype=torch.long), torch.tensor(target_ids, dtype=torch.long)
+        if isinstance(logits, torch.Tensor):
+            l = logits.detach().cpu().to(torch.float)
+        elif isinstance(logits, np.ndarray):
+            l = torch.from_numpy(logits).float()
+        elif isinstance(logits, list):
+            # try torch.tensor directly (handles lists of floats/ints)
+            try:
+                l = torch.tensor(logits, dtype=torch.float)
+            except Exception:
+                # deeper conversion if inner elements are torch tensors or scalars
+                inner = []
+                for rrow in logits:
+                    inner_row = []
+                    for el in rrow:
+                        if isinstance(el, torch.Tensor):
+                            inner_row.append(float(el.item()))
+                        else:
+                            inner_row.append(float(el))
+                    inner.append(inner_row)
+                l = torch.tensor(inner, dtype=torch.float)
+        else:
+            raise TypeError(f"Unsupported logits type for layer {lname}: {type(logits)}")
+
+        if l.dim() != 2:
+            # try to coerce shape to [S,V]
+            l = l.reshape(-1, l.shape[-1]) if l.numel() != 0 else l.unsqueeze(0)
+
+        layer_tensors.append(l.to(torch.float))
+
+    layers_tensor = torch.stack(layer_tensors, dim=0)  # [L, S, V] on CPU
+    return layers_tensor, input_ids_t, target_ids_t
 
 
-def get_carry_over_safe_with_embedding(saved_df, topk=5, prefix='layers.'):
+def get_carry_over_safe_with_embedding(saved_df: Union[pd.DataFrame, list], topk: int = TOPK, prefix: str = ''):
     """
-    saved_df: your loaded DataFrame (torch.load .pt returns the df)
-    Returns a dict with per-prompt results and a global mean.
+    saved_df: pd.DataFrame or list-of-dicts (rows saved by logit-lens)
+    Returns: {'per_prompt': {pid: metrics...}, 'mean': aggregated}
     """
-    canonical_layers = canonical_layer_names_from_df(saved_df, prefix=prefix)
+    # Normalize to DataFrame for name handling
+    if isinstance(saved_df, list):
+        df = pd.DataFrame(saved_df)
+    elif isinstance(saved_df, pd.DataFrame):
+        df = saved_df
+    else:
+        try:
+            df = pd.DataFrame(saved_df)
+        except Exception:
+            raise TypeError("saved_df must be a DataFrame or a list of dicts")
+
+    canonical_layers = canonical_layer_names_from_df(df, prefix=prefix)
     if len(canonical_layers) == 0:
-        raise ValueError("No canonical 'layers.N' names found in df")
+        raise ValueError("No canonical layer names found in df with given prefix")
 
     results_per_prompt = {}
-    # group by prompt_id
-    if 'prompt_id' not in saved_df.columns:
+    if 'prompt_id' not in df.columns:
         raise KeyError("DataFrame must contain 'prompt_id' column.")
-    prompt_ids = sorted(saved_df['prompt_id'].unique().tolist())
+    prompt_ids = sorted(df['prompt_id'].unique().tolist())
 
     for pid in prompt_ids:
-        df_prompt = saved_df[saved_df['prompt_id'] == pid]
+        df_prompt = df[df['prompt_id'] == pid]
         layers_tensor, input_ids, target_ids = prepare_layer_tensors_for_prompt(df_prompt, canonical_layers)
         metrics = compute_carry_over_safe_with_embedding_vectorized(layers_tensor, input_ids, target_ids, topk=topk)
-        results_per_prompt[pid] = metrics
+        results_per_prompt[int(pid)] = metrics
 
-    # compute simple average across prompts (equal weighting)
+    # aggregate mean across prompts
     agg = {}
     keys = list(next(iter(results_per_prompt.values())).keys())
     for k in keys:
-        agg[k] = float(np.mean([results_per_prompt[pid][k] for pid in prompt_ids]))
+        agg[k] = float(np.mean([results_per_prompt[pid][k] for pid in results_per_prompt.keys()]))
 
     return {'per_prompt': results_per_prompt, 'mean': agg}
+
 
 
 def compute_carry_over_safe_partitioned(

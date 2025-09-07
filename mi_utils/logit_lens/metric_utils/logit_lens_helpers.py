@@ -1,6 +1,7 @@
 from typing import Tuple, List, Any
 import os
 import torch
+from scipy.special import rel_entr
 from sklearn.decomposition import PCA
 import numpy as np
 import pandas as pd
@@ -14,6 +15,7 @@ from ...util.logit_lens_utils.logit_lens_wrapper import LogitLensWrapper
 # Reusable Inputs
 # ----------------------------
 EPS = 1e-12
+#EPS = 1e-8 
 TOPK = 5
 
 
@@ -145,8 +147,8 @@ def align_activations(act1, act2):
     return act1, act2
 
 
-def compute_ece(probs: np.ndarray, targets: np.ndarray, n_bins=10):
-    """Expected Calibration Error; preserves NaNs/Infs."""
+"""def compute_ece(probs: np.ndarray, targets: np.ndarray, n_bins=10):
+    #Expected Calibration Error; preserves NaNs/Infs.
     confidences = np.max(probs, axis=1)
     predictions = np.argmax(probs, axis=1)
     accuracies = (predictions == targets)
@@ -158,7 +160,27 @@ def compute_ece(probs: np.ndarray, targets: np.ndarray, n_bins=10):
             avg_conf = np.nanmean(confidences[mask])
             avg_acc = np.nanmean(accuracies[mask])
             ece += np.abs(avg_conf - avg_acc) * np.mean(mask)
-    return ece
+    return ece"""
+
+def compute_ece(probs: np.ndarray, targets: np.ndarray, n_bins: int = 15) -> float:
+    """
+    Expected Calibration Error (ECE)
+    probs: [seq_len, vocab_size] probability distribution (numpy)
+    targets: [seq_len] true token ids
+    """
+    confidences = probs.max(axis=1)
+    predictions = probs.argmax(axis=1)
+    accuracies = (predictions == targets).astype(float)
+
+    bin_boundaries = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        mask = (confidences > bin_boundaries[i]) & (confidences <= bin_boundaries[i + 1])
+        if mask.any():
+            acc = accuracies[mask].mean()
+            conf = confidences[mask].mean()
+            ece += np.abs(acc - conf) * mask.mean()
+    return float(ece)
 
 
 def topk_overlap_and_kendall(probs_a, probs_b, k=TOPK):
