@@ -4,6 +4,7 @@ torchvision
 torchaudio
 transformers[torch]==4.55.0
 huggingface_hub
+accelerate
 bitsandbytes
 
 datasets

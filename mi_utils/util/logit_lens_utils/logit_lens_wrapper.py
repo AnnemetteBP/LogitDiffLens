@@ -145,16 +145,16 @@ class LogitLensWrapper:
     def tokenize_inputs(
         self,
         texts: List[str],
-        add_special_tokens: bool = True,
+        add_special_tokens: bool = False,  # default OFF for probing
         add_bos: bool = False,
-        add_eos: bool = True,
-        max_len: int = 32,
+        add_eos: bool = False,
+        max_len: int = 24,
+        pad_to_max_length: bool = False,
         move_to_device: bool = True,
     ):
         tokenizer = self.tokenizer
         model = self.model
 
-        # Handle BOS/EOS manually if requested
         processed = []
         for t in texts:
             if add_bos and tokenizer.bos_token is not None and not t.startswith(tokenizer.bos_token):
@@ -163,22 +163,21 @@ class LogitLensWrapper:
                 t = t + tokenizer.eos_token
             processed.append(t)
 
-        # Tokenize
         inputs = tokenizer(
             processed,
             return_tensors="pt",
-            padding=True,   # safe now, pad_token guaranteed
+            padding="longest" if not pad_to_max_length else True,  # match heatmap
             truncation=True,
             max_length=max_len,
             add_special_tokens=add_special_tokens,
         )
 
-        # Move tensors to device
         if move_to_device:
             device = next(model.parameters()).device
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
         return inputs
+
 
 
     # ----------------------------
@@ -193,18 +192,22 @@ class LogitLensWrapper:
         keep_on_device: bool = True,
         project_on_lm_head_dtype: bool = True,
         force_dtype: Optional[torch.dtype] = None,
-        add_bos: bool = False,
-        add_eos: bool = True,
-        max_len: int = 32,
+        add_special_tokens: bool = False,  # default OFF for probing
+        add_bos: bool = False,             # handle manually if needed
+        add_eos: bool = False,
+        pad_to_max_length: bool = False, 
+        max_len: int = 316,
     ) -> Tuple[Any, Dict[str, torch.Tensor], List[str]]:
         """
         Forward that preserves dtype/device. Returns layer tensors on-device by default.
         """
         inputs = self.tokenize_inputs(
             texts=texts,
+            add_special_tokens=add_special_tokens,
             add_bos=add_bos,
             add_eos=add_eos,
             max_len=max_len,
+            pad_to_max_length=pad_to_max_length,
             move_to_device=True,
         )
 

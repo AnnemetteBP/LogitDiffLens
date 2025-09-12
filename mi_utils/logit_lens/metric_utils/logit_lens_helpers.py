@@ -1,4 +1,4 @@
-from typing import Tuple, List, Any
+from typing import Tuple, List, Any, Optional
 import os
 import torch
 from scipy.special import rel_entr
@@ -447,3 +447,69 @@ def safe_metric(metric_func, *args, default=np.nan):
         return np.array(val, dtype=float)
     except Exception:
         return default
+    
+
+def safe_tensor(t: torch.Tensor, eps: float = EPS, target_dtype: Optional[torch.dtype] = None, for_log: bool = False):
+    dtype = target_dtype
+    if dtype is None:
+        if t.dtype in [torch.float16, torch.float32]:
+            dtype = t.dtype
+        else:
+            dtype = torch.float32  
+
+    if t.dtype != dtype:
+        t = t.to(dtype)
+
+    # NaN / inf protection
+    t = torch.nan_to_num(t, nan=-1e9, posinf=1e9, neginf=-1e9)
+
+    # Clamp safely
+    max_val = 1e5
+    min_val = -1e5
+
+    t = torch.clamp(t, min=min_val, max=max_val)
+
+    if for_log:
+        t = t.clamp_min(eps)
+
+    return t
+
+def safe_entropy(probs: torch.Tensor, eps: float = EPS) -> torch.Tensor:
+    """
+    Compute entropy safely for float16 or float32 probabilities.
+    probs: [*, V] tensor, can be float16 or float32
+    eps: minimum probability
+    """
+    # Cast to float32 for safe log computation
+    probs_f32 = probs.to(torch.float32)
+
+    # Clamp small probabilities
+    probs_f32 = probs_f32.clamp(min=eps, max=1.0)
+
+    log_probs = torch.log(probs_f32)
+    ent = -(probs_f32 * log_probs).sum(dim=-1)
+
+    return ent
+
+def safe_cast_logits(tensor: torch.Tensor, target_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    dtype = target_dtype or (tensor.dtype if tensor.dtype in [torch.float16, torch.float32] else torch.float32)
+    if tensor.dtype != dtype:
+        tensor = tensor.to(dtype)
+
+    # NaN / inf protection
+    tensor = torch.nan_to_num(tensor, nan=-1e9, posinf=1e9, neginf=-1e9)
+
+    # Clamp safely
+    max_val = 1e5
+    min_val = -1e5
+
+    tensor = torch.clamp(tensor, min=min_val, max=max_val)
+    return tensor
+
+
+def safe_softmax(logits: torch.Tensor, dim=-1, eps=EPS) -> torch.Tensor:
+    max_logits = logits.max(dim=dim, keepdim=True).values
+    exp_logits = torch.exp(logits - max_logits)
+    sum_exp = exp_logits.sum(dim=dim, keepdim=True)
+    probs = exp_logits / (sum_exp + eps)
+    return probs.clamp(min=eps, max=1.0)

@@ -2,7 +2,8 @@ import re
 import math
 import torch
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Union
+import pandas as pd
 
 
 
@@ -10,58 +11,47 @@ TOPK = 5
 # -----------------------------------------------------------------------------
 # Core vectorized metric computation (expects layers_tensor: [L, S, V])
 # -----------------------------------------------------------------------------
-# paste into mi_utils/logit_lens/metric_utils/carry_over_safe_metrics.py
-import re
-from typing import List, Optional, Union
-import numpy as np
-import torch
-import pandas as pd
-
-# Keep using module-level TOPK/EPS if present; functions accept topk param too.
 
 def compute_carry_over_safe_with_embedding_vectorized(
     layers_tensor: torch.Tensor,
     input_ids: torch.Tensor,
     target_ids: torch.Tensor,
-    topk: int = TOPK,
-    pad_token_id: Optional[int] = 0
+    topk: int = 5,
+    enforce_carry_over_safe: bool = True
 ):
     """
     Vectorized carry-over-safe metrics on a stacked layers tensor.
-    layers_tensor: [L, S, V] (torch.Tensor, CPU or device)
-    input_ids: [S] (torch.Tensor)
-    target_ids: [S] (torch.Tensor)
-    Returns: dict of scalar metrics (same keys you had before)
+    
+    Args:
+        layers_tensor: [L, S, V] (torch.Tensor, logits per layer)
+        input_ids: [S] (torch.Tensor, input tokens)
+        target_ids: [S] (torch.Tensor, ground-truth tokens)
+        topk: number of top-k predictions to consider
+        enforce_carry_over_safe: bool, whether to exclude lexical carry-over (predictions == input token)
+    
+    Returns:
+        dict of scalar metrics (float)
     """
     # shapes & types
     L, S, V = layers_tensor.shape
     device = layers_tensor.device
     dtype = layers_tensor.dtype
 
-    # ensure 1D input/target on same device
-    target_b = target_ids.to(device).unsqueeze(0)  # [1,S]
-    input_b = input_ids.to(device).unsqueeze(0)    # [1,S]
-    pad_mask_b = (input_b != pad_token_id)         # [1,S]
-
-    # Expand to layer dimension so slices like [1:] make sense
-    if L > 1:
-        target_layer = target_b.repeat(L, 1)    # [L, S]
-        input_layer = input_b.repeat(L, 1)      # [L, S]
-        pad_mask_layer = pad_mask_b.repeat(L, 1)# [L, S]
-    else:
-        # L == 1; keep shapes consistent
-        target_layer = target_b.clone()
-        input_layer = input_b.clone()
-        pad_mask_layer = pad_mask_b.clone()
+    # prepare broadcasted inputs
+    target_layer = target_ids.to(device).unsqueeze(0).expand(L, -1)  # [L,S]
+    input_layer  = input_ids.to(device).unsqueeze(0).expand(L, -1)   # [L,S]
 
     # ----------------- Top-1 / Top-K predictions -----------------
     top1_preds = layers_tensor.argmax(dim=-1)  # [L,S]
-    # top1_valid: whether predicted token equals target and not just copied from input & not pad
-    top1_valid = (top1_preds == target_layer) & (top1_preds != input_layer) & pad_mask_layer
+    top1_valid = (top1_preds == target_layer)
+    if enforce_carry_over_safe:
+        top1_valid &= (top1_preds != input_layer)
 
     k_eff = min(topk, V)
     topk_inds = layers_tensor.topk(k_eff, dim=-1).indices  # [L,S,k]
-    topk_valid = ((topk_inds == target_b.unsqueeze(-1)).any(-1)) & (target_layer != input_layer) & pad_mask_layer
+    topk_valid = (topk_inds == target_layer.unsqueeze(-1)).any(-1)
+    if enforce_carry_over_safe:
+        topk_valid &= (target_layer != input_layer)
 
     # ---------------- Accuracy ----------------
     acc_top1 = top1_valid.any(dim=0).to(dtype)   # [S]
@@ -69,27 +59,20 @@ def compute_carry_over_safe_with_embedding_vectorized(
 
     # ---------------- Persistency ----------------
     if L > 1:
-        persistency_top1 = (
-            ((top1_preds[1:] == top1_preds[:-1]) & (top1_preds[1:] != input_layer[1:]) & pad_mask_layer[1:])
-            .to(dtype)
-            .mean(dim=0)
-        )
-        persistency_topk = (
-            ((topk_inds[1:] == topk_inds[:-1]).all(dim=-1) & (target_layer[1:] != input_layer[1:]) & pad_mask_layer[1:])
-            .to(dtype)
-            .mean(dim=0)
-        )
+        persistency_top1 = ((top1_preds[1:] == top1_preds[:-1]).to(dtype).mean(dim=0))
+        persistency_topk = (((topk_inds[1:] == topk_inds[:-1]).all(dim=-1)).to(dtype).mean(dim=0))
+        if enforce_carry_over_safe:
+            persistency_top1 *= (top1_preds[1:] != input_layer[1:]).to(dtype).mean(dim=0)
+            persistency_topk *= (target_layer[1:] != input_layer[1:]).to(dtype).mean(dim=0)
     else:
-        # No temporal layers to compare -> zeros
         persistency_top1 = torch.zeros(S, dtype=dtype, device=device)
         persistency_topk = torch.zeros(S, dtype=dtype, device=device)
 
     # ---------------- Consistency ----------------
-    cum_top1 = top1_valid.cumsum(dim=0) > 0                              # [L,S]
+    cum_top1 = top1_valid.cumsum(dim=0) > 0
     prev_top1 = torch.cat([torch.zeros((1, S), dtype=torch.bool, device=device), cum_top1[:-1]], dim=0)
-    first_top1_mask = top1_valid & (~prev_top1)                           # [L,S]
-    exists_top1 = first_top1_mask.any(dim=0)                              # [S]
-    # Use argmax on boolean -> index of first True per column
+    first_top1_mask = top1_valid & (~prev_top1)
+    exists_top1 = first_top1_mask.any(dim=0)
     first_top1_idx = torch.where(
         exists_top1,
         first_top1_mask.to(dtype).argmax(dim=0).long(),
@@ -106,7 +89,6 @@ def compute_carry_over_safe_with_embedding_vectorized(
         torch.full((S,), -1, dtype=torch.long, device=device)
     )
 
-    # Consistency: suf_counts = number of valid positions from first occurrence onward
     suf_top1_counts = top1_valid.flip(0).cumsum(dim=0).flip(0).to(dtype)
     suf_topk_counts = topk_valid.flip(0).cumsum(dim=0).flip(0).to(dtype)
 
@@ -115,7 +97,6 @@ def compute_carry_over_safe_with_embedding_vectorized(
     if mask1.any():
         idxs = first_top1_idx[mask1]
         s_idx = mask1.nonzero(as_tuple=True)[0]
-        # gather counts: suf_top1_counts[idxs, s_idx]
         consistency_top1[mask1] = suf_top1_counts[idxs, s_idx] / (L - idxs).to(dtype)
 
     consistency_topk = torch.zeros(S, dtype=dtype, device=device)
@@ -137,7 +118,7 @@ def compute_carry_over_safe_with_embedding_vectorized(
         earliness_top1 = torch.zeros(S, dtype=dtype, device=device)
         earliness_topk = torch.zeros(S, dtype=dtype, device=device)
 
-    # ---------------- Aggregate scalars (mean across positions) ----------------
+    # ---------------- Aggregate scalars ----------------
     out = {
         'acc_top1_scalar': float(acc_top1.mean().item()),
         'acc_topk_scalar': float(acc_topk.mean().item()),
@@ -312,67 +293,3 @@ def get_carry_over_safe_with_embedding(saved_df: Union[pd.DataFrame, list], topk
 
     return {'per_prompt': results_per_prompt, 'mean': agg}
 
-
-
-def compute_carry_over_safe_partitioned(
-    saved_df,
-    topk: int = TOPK,
-    prefix: str = "layers.",
-    partitions: Optional[dict] = None
-):
-    """
-    saved_df: the DataFrame from your logit-lens run
-    topk: top-k for metrics
-    prefix: layer name prefix
-    partitions: optional dict {'early': (0, 0.25), 'mid': (0.25,0.5), ...} as fractions of total layers
-                if None, default 4 equal partitions are used
-
-    Returns: dict with per-prompt and per-partition averages
-    """
-    canonical_layers = canonical_layer_names_from_df(saved_df, prefix=prefix)
-    if len(canonical_layers) == 0:
-        raise ValueError("No canonical 'layers.N' names found in df")
-    num_layers = len(canonical_layers)
-
-    # default 4 partitions
-    if partitions is None:
-        partitions = {
-            "early": (0.0, 0.25),
-            "mid": (0.25, 0.5),
-            "late": (0.5, 0.75),
-            "last": (0.75, 1.0)
-        }
-
-    # build partition layer indices
-    partition_indices = {}
-    for name, (start_frac, end_frac) in partitions.items():
-        start_idx = int(start_frac * num_layers)
-        end_idx = int(end_frac * num_layers)
-        partition_indices[name] = list(range(start_idx, end_idx))
-
-    results_per_prompt = {}
-    prompt_ids = sorted(saved_df['prompt_id'].unique().tolist())
-
-    for pid in prompt_ids:
-        df_prompt = saved_df[saved_df['prompt_id'] == pid]
-        layers_tensor, input_ids, target_ids = prepare_layer_tensors_for_prompt(df_prompt, canonical_layers)
-
-        metrics_per_partition = {}
-        for pname, idxs in partition_indices.items():
-            if len(idxs) == 0:
-                continue
-            layers_sub = layers_tensor[idxs]  # [L_sub, S, V]
-            metrics = compute_carry_over_safe_with_embedding_vectorized(layers_sub, input_ids, target_ids, topk=topk)
-            metrics_per_partition[pname] = metrics
-
-        results_per_prompt[pid] = metrics_per_partition
-
-    # compute global mean per partition
-    all_partitions = partitions.keys()
-    agg = {pname: {} for pname in all_partitions}
-    for pname in all_partitions:
-        keys = list(next(iter(results_per_prompt.values()))[pname].keys())
-        for k in keys:
-            agg[pname][k] = float(np.mean([results_per_prompt[pid][pname][k] for pid in prompt_ids]))
-
-    return {"per_prompt": results_per_prompt, "per_partition_mean": agg}
