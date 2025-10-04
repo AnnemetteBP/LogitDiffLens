@@ -106,8 +106,8 @@ class LlamaPromptLens:
     """
     Unified Logit Lens interface for LLaMA-style models.
     Supports:
-      - Nostalgebraist (only final norm)
-      - LogitLens4LLMs (per-layer norm)
+      - Nostalgebraist (only final norm): https://www.lesswrong.com/posts/AcKRB8wDpdaN6v6ru/interpreting-gpt-the-logit-lens
+      - LogitLens4LLMs (per-layer norm): https://arxiv.org/abs/2503.11667
       - optional subblocks (attn/mlp)
       - embedding token probing
     """
