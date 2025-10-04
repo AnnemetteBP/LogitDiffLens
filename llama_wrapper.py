@@ -164,6 +164,9 @@ class LlamaPromptLens:
         tokenizer = self.tokenizer
         model.eval()
 
+        #print("Tokenizer length:", len(tokenizer))
+        #print("Model lm_head weight shape:", model.lm_head.weight.shape)
+
         inputs = tokenizer(prompt, return_tensors="pt").to(model_device)
         x = model.model.embed_tokens(inputs.input_ids)
         layer_logits = {"embed_tokens": model.lm_head(x)}
