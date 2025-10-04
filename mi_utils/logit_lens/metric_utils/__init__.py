@@ -1,8 +1,8 @@
-from . import interp_degradation_scores
+from ..misc import interp_degradation_scores
 from . import carry_over_safe_metrics
-from . import logit_lens_helpers
+from ..misc import logit_lens_helpers
 
-from .interp_degradation_scores import (
+from ..misc.interp_degradation_scores import (
     degradation_diff_score,
     interpretability_diff_score,
     degradation_score
@@ -11,7 +11,7 @@ from .carry_over_safe_metrics import (
     get_carry_over_safe_with_embedding,
 )
 
-from .logit_lens_helpers import(
+from ..misc.logit_lens_helpers import(
     save_results_to_csv,
     extract_activations,
     get_activation_tensor,

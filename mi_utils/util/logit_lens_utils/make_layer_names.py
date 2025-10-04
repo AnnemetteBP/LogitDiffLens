@@ -42,7 +42,7 @@ def make_gpt2_layer_names(
     return names
 
 
-def make_llama_layer_names(
+"""def make_llama_layer_names(
     model,
     block_step:int=1,
     include_input:bool=True,
@@ -84,4 +84,63 @@ def make_llama_layer_names(
 
     names = [name for name in names if not any([_names_overlap(name, dname) for dname in decoder_layer_names])]
 
+    return names"""
+
+def make_llama_layer_names(
+    model,
+    block_step: int = 1,
+    include_input: bool = True,
+    force_include_output: bool = True,
+    include_subblocks: bool = False,
+    decoder_layer_names: list[str] = ['norm', 'lm_head']
+):
+    """Generates canonical layer names for LLaMA-based models."""
+
+    # Helper to safely add ".out"
+    def add_suffix(name):
+        return name if name.endswith(".out") else f"{name}.out"
+
+    # Grab transformer layers
+    h = get_child_module_by_names(model.base_model, ["layers"])
+    h_names = [f"layers.{i}" for i in range(len(h))]
+
+    # Ensure final block is included
+    last_layer_name = h_names[-1]
+    h_names = h_names[::block_step]
+    if force_include_output and last_layer_name not in h_names:
+        h_names.append(last_layer_name)
+
+    # Expand into subblocks
+    if include_subblocks:
+        names = []
+        for name in h_names:
+            names.extend([
+                add_suffix(f"{name}.input_layernorm"),
+                add_suffix(f"{name}.self_attn"),
+                add_suffix(f"{name}.post_attention_layernorm"),
+                add_suffix(f"{name}.mlp"),
+                name  # residual output (no .out, consistent with hooks)
+            ])
+    else:
+        names = h_names
+
+    # Add embedding layer
+    if include_input:
+        names = ["embed_tokens"] + names
+
+    # Remove decoder-only layers
+    def _subset(a, b):
+        return a == b or a.startswith(b + ".")
+
+    def _names_overlap(a, b):
+        return _subset(a, b) or _subset(b, a)
+
+    names = [name for name in names if not any(_names_overlap(name, d) for d in decoder_layer_names)]
+
+    # Add final normalization + output placeholder
+    if force_include_output:
+        names.append("final_norm.out")
+        names.append("output")
+
     return names
+

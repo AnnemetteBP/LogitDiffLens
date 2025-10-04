@@ -15,6 +15,7 @@ pandas
 scipy
 networkx
 scikit-learn
+umap-learn
 
 notebook
 ipykernel
