@@ -54,6 +54,16 @@ def detect_architecture(model):
         return "gpt"
     raise NotImplementedError(f"Cannot detect architecture for {type(model)}")
 
+def mask_special_logits(logits_dict, tokenizer):
+    special_ids = [
+        tokenizer.bos_token_id,
+        tokenizer.eos_token_id,
+        tokenizer.pad_token_id,
+    ]
+    special_ids = [sid for sid in special_ids if sid is not None]
+    for name, logits in logits_dict.items():
+        logits[:, :, special_ids] = float("-inf")
+    return logits_dict
 
 # -----------------------------
 # Core Wrapper
@@ -153,6 +163,8 @@ class LlamaPromptLens:
             self.tokenizer.add_special_tokens(specials)
             if hasattr(self.model, "resize_token_embeddings"):
                 self.model.resize_token_embeddings(len(self.tokenizer))
+    
+        #print(self.tokenizer .pad_token, self.tokenizer .pad_token_id)
 
     # -----------------
     # Probe (single prompt)
@@ -375,6 +387,128 @@ def _run_logit_lens_batch(
     return pd.DataFrame(rows)
 
 
+@torch.no_grad()
+def _run_logit_lens_autoregressive_batch(
+    lens,
+    prompts,
+    dataset_name="default",
+    proj_precision=None,
+    max_steps=10,
+    mask_special=True,
+    mode="teacher",  # ["teacher", "greedy", "sample"]
+    temperature=None,
+):
+    """
+    Autoregressive or teacher-forced logit-lens analysis.
+    Collects per-layer logits after each generation step.
+
+    Modes:
+        - "teacher": Use the ground truth next tokens (deterministic teacher forcing)
+        - "greedy":  Autoregressive deterministic generation (argmax)
+        - "sample":  Autoregressive stochastic generation (sampling)
+
+    Args:
+        lens: LlamaPromptLens instance
+        prompts: List[str]
+        dataset_name: str
+        proj_precision: Optional[str] ("fp16" or "fp32")
+        max_steps: int, number of tokens to generate per prompt
+        mask_special: bool, mask BOS/EOS/PAD tokens
+        mode: "teacher" | "greedy" | "sample"
+        temperature: float, optional override (defaults depend on mode)
+    """
+    model = lens.model
+    tokenizer = lens.tokenizer
+    model.eval()
+    device = next(model.parameters()).device
+
+    # --- Mode defaults ---
+    teacher_forcing = (mode == "teacher")
+    greedy = (mode == "greedy")
+    if temperature is None:
+        temperature = 1e-6 if mode in ["teacher", "greedy"] else 0.7
+
+    # --- Token + vocab info ---
+    vocab_size = getattr(tokenizer, "vocab_size", None) or getattr(model.lm_head, "out_features", None)
+    special_ids = set(
+        sid for sid in [
+            tokenizer.bos_token_id,
+            tokenizer.eos_token_id,
+            tokenizer.pad_token_id,
+            128000,  # Unicode prefix for LLaMA-3
+        ] if sid is not None
+    )
+
+    rows = []
+
+    for b, prompt in enumerate(prompts):
+        encoded = tokenizer(prompt, return_tensors="pt").to(device)
+        full_input_ids = encoded.input_ids[0]
+
+        # Start with BOS or first token
+        input_ids = full_input_ids[:1].unsqueeze(0)
+        current_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+
+        for step in range(max_steps):
+            # --- Run logit-lens on current prefix ---
+            layer_logits = lens.probe_prompt(current_text)
+            stacked, layer_names = lens.stack_layer_logits(layer_logits, keep_on_device=False)
+            seq_len = input_ids.size(1)
+
+            for li, (lname, logits) in enumerate(zip(layer_names, stacked)):
+                logits_cur = logits[0, :seq_len].float()
+                if proj_precision == "fp16":
+                    logits_cur = logits_cur.half()
+                logits_cur = logits_cur[:-1]  # drop last step (no target)
+
+                rows.append({
+                    "prompt_id": b,
+                    "prompt_text": prompt,
+                    "dataset": dataset_name,
+                    "vocab_size": vocab_size,
+                    "layer_index": li,
+                    "layer_name": lname,
+                    "input_ids": input_ids[0].cpu(),
+                    "target_ids": input_ids[0, 1:seq_len],
+                    "logits": logits_cur,
+                    "position": torch.arange(seq_len - 1),
+                    "generated_step": step,
+                    "generated_text": current_text,
+                })
+
+            # --- Determine next token ---
+            if teacher_forcing:
+                if step + 1 >= len(full_input_ids):
+                    break
+                next_token = full_input_ids[step + 1].unsqueeze(0).unsqueeze(0)
+            else:
+                logits = model(input_ids).logits
+                next_token_logits = logits[:, -1, :]
+
+                if mask_special and len(special_ids) > 0:
+                    next_token_logits[:, list(special_ids)] = float("-inf")
+
+                next_token_logits /= temperature
+                probs = torch.softmax(next_token_logits, dim=-1)
+
+                next_token = (
+                    torch.argmax(probs, dim=-1, keepdim=True)
+                    if greedy else torch.multinomial(probs, num_samples=1)
+                )
+
+            # --- Update context ---
+            next_token_id = next_token.item()
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
+            current_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+
+            if next_token_id in special_ids:
+                break
+
+        torch.cuda.empty_cache()
+
+    df = pd.DataFrame(rows)
+    return df
+
 
 def run_logit_lens_batched(
     lens: LlamaPromptLens,
@@ -386,6 +520,9 @@ def run_logit_lens_batched(
     batch_size: int = 8,
     **kwargs,
 ):
+    """
+        Run prompt probing lens
+    """
     os.makedirs(save_dir, exist_ok=True)
     for i, start in enumerate(range(0, len(prompts), batch_size)):
         batch_prompts = prompts[start : start + batch_size]
@@ -404,4 +541,65 @@ def run_logit_lens_batched(
             print(f"[✓] Saved batch {i}: {batch_path}")
         torch.cuda.empty_cache()
     print(f"All {len(prompts)} prompts processed.")
+
+
+def run_logit_lens_autoregressive_batched(
+    lens: LlamaPromptLens,
+    prompts: List[str],
+    dataset_name: str = "default",
+    model_name: str = "model",
+    save_dir: str = "logs/lens_batches_autoreg",
+    proj_precision: str = None,
+    batch_size: int = 1,
+    max_steps: int = 5,
+    **kwargs,
+):
+    """
+    Run autoregressive or teacher-forced logit-lens analysis in batches.
+    Params/Args:
+        Mode: mode = "teacher", or "greedy" / "sample"
+
+    Usage examples:
+        1. Teacher-Forcing (Evaluation Mode)
+            run_logit_lens_autoregressive_batched(
+                lens, ["Translate: English 'flower' → German: Blume"],
+                mode="teacher", max_steps=10
+            )
+
+        2. Greedy Autoregressive (Deterministic Drift)
+            run_logit_lens_autoregressive_batched(
+                lens, ["The capital of France is"],
+                mode="greedy", max_steps=10
+            )
+
+        3. Sampling Autoregressive (Stochastic Drift)
+            run_logit_lens_autoregressive_batched(
+                lens, ["Daniel went to the garden. Mary went to the kitchen. Where is Mary? Answer:"],
+                mode="sample", temperature=0.7, max_steps=10
+            )
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    for i, start in enumerate(range(0, len(prompts), batch_size)):
+        batch_prompts = prompts[start : start + batch_size]
+
+        df_batch = _run_logit_lens_autoregressive_batch(
+            lens=lens,
+            prompts=batch_prompts,
+            dataset_name=dataset_name,
+            proj_precision=proj_precision,
+            max_steps=max_steps,  # ← fixed here
+            **kwargs,
+        )
+
+        if not df_batch.empty:
+            batch_path = os.path.join(
+                save_dir, f"{dataset_name}_{model_name}_autoreg_batch{i}.pt"
+            )
+            torch.save(df_batch, batch_path)
+            print(f"[✓] Saved autoregressive batch {i}: {batch_path}")
+
+        torch.cuda.empty_cache()
+
+    print(f"All {len(prompts)} prompts processed autoregressively.")
 
