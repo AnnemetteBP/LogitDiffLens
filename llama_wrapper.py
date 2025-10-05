@@ -115,24 +115,26 @@ class BlockOutputWrapper(torch.nn.Module):
 class LlamaPromptLens:
     """
     Unified Logit Lens interface for LLaMA-style models.
-    Supports Modes:
-      - "none": Nostalgebraist, No normalization (raw hidden states) (only final norm): https://www.lesswrong.com/posts/AcKRB8wDpdaN6v6ru/interpreting-gpt-the-logit-lens
-      - "model": Use model’s own RMSNorm (faithful internal states), “True model” lens
-      - "unit": LogitLens4LLMs (per-layer norm): https://arxiv.org/abs/2503.11667, Normalize hidden vectors to unit norm before projection
-      - optional subblocks (attn/mlp)
-      - embedding token probing
+
+    Normalization modes:
+      - "none":  Nostalgebraist — raw hidden states (no per-layer normalization, only final RMSNorm)
+                  Ref: https://www.lesswrong.com/posts/AcKRB8wDpdaN6v6ru/interpreting-gpt-the-logit-lens
+      - "model": True-model internal states — use model’s own RMSNorms (`input_layernorm` / `post_attention_layernorm`)
+      - "unit_l2": Normalize each hidden vector to unit L2 norm (heuristic, scale-invariant)
+      - "unit_rms": Apply model’s *final RMSNorm weights* at every layer (faithful to LogitLens4LLMs, Eq. 1)
+                    Ref: https://arxiv.org/abs/2503.11667
     """
 
     def __init__(
         self,
         model_id: str = "meta-llama/Llama-3.1-8B-Instruct",
-        apply_per_layer_norm: bool = False,
+        normalization_mode: str = "none",
         include_subblocks: bool = False,
         device: Optional[str] = None,
     ):
         self.model, self.tokenizer = load_model_and_tok(model_id)
         self.device = device or get_model_device(self.model)
-        self.apply_per_layer_norm = apply_per_layer_norm
+        self.normalization_mode = normalization_mode
         self.include_subblocks = include_subblocks
 
         self.is_quantized = is_quantized_model(self.model)
@@ -164,8 +166,6 @@ class LlamaPromptLens:
             self.tokenizer.add_special_tokens(specials)
             if hasattr(self.model, "resize_token_embeddings"):
                 self.model.resize_token_embeddings(len(self.tokenizer))
-    
-        #print(self.tokenizer .pad_token, self.tokenizer .pad_token_id)
 
     # -----------------
     # Probe (single prompt)
@@ -173,8 +173,8 @@ class LlamaPromptLens:
     @torch.no_grad()
     def probe_prompt(self, prompt: str) -> Dict[str, torch.Tensor]:
         model = self.model
-        model_device = get_model_device(model)
         tokenizer = self.tokenizer
+        model_device = get_model_device(model)
         model.eval()
 
         inputs = tokenizer(prompt, return_tensors="pt").to(model_device)
@@ -182,79 +182,82 @@ class LlamaPromptLens:
         layer_logits = {"embed_tokens": model.lm_head(x)}
 
         for i, block in enumerate(model.model.layers):
-            # --- Subblock probing ---
             if self.include_subblocks:
+                # --- Attention sublayer ---
                 attn_in = block.input_layernorm(x)
                 attn_out = block.self_attn(attn_in)[0]
                 attn_hidden = x + attn_out
 
+                # --- MLP sublayer ---
                 mlp_in = block.post_attention_layernorm(attn_hidden)
                 mlp_out = block.mlp(mlp_in)
                 block_out = attn_hidden + mlp_out
 
                 # --- Normalization selection ---
-                if self.normalization_mode == "none":
-                    normed = block_out
-                elif self.normalization_mode == "model":
-                    normed = block.post_attention_layernorm(block_out)
-                elif self.normalization_mode == "unit":
-                    normed = block_out / (block_out.norm(dim=-1, keepdim=True) + 1e-6)
-                else:
-                    raise ValueError(f"Unknown normalization_mode: {self.normalization_mode}")
+                normed = self._apply_normalization(block_out, block)
 
-                # --- Projections ---
-                layer_logits[f"layer_{i}.self_attn"] = model.lm_head(
-                    self._normalize_for_mode(attn_out)
-                )
-                layer_logits[f"layer_{i}.mlp"] = model.lm_head(
-                    self._normalize_for_mode(mlp_out)
-                )
-                layer_logits[f"layer_{i}.block_out"] = model.lm_head(normed)
+                # --- Projections for subcomponents ---
+                layer_logits[f"layer.{i}.self_attn"] = model.lm_head(self._normalize_for_mode(attn_out))
+                layer_logits[f"layer.{i}.mlp"] = model.lm_head(self._normalize_for_mode(mlp_out))
+                layer_logits[f"layer.{i}.block_out"] = model.lm_head(normed)
                 x = block_out
 
-            # --- Full-block probing ---
             else:
+                # --- Whole block output probing ---
                 out = block(x)[0]
-
-                if self.normalization_mode == "none":
-                    normed = out
-                elif self.normalization_mode == "model":
-                    normed = block.post_attention_layernorm(out)
-                elif self.normalization_mode == "unit":
-                    normed = out / (out.norm(dim=-1, keepdim=True) + 1e-6)
-                else:
-                    raise ValueError(f"Unknown normalization_mode: {self.normalization_mode}")
-
-                layer_logits[f"layer_{i}"] = model.lm_head(normed)
+                normed = self._apply_normalization(out, block)
+                layer_logits[f"layer.{i}"] = model.lm_head(normed)
                 x = out
 
-        # --- Final output normalization ---
-        if self.normalization_mode == "none":
-            final_hidden = model.model.norm(x)  # model RMSNorm
-        elif self.normalization_mode == "model":
-            final_hidden = model.model.norm(x)
-        elif self.normalization_mode == "unit":
-            final_hidden = x / (x.norm(dim=-1, keepdim=True) + 1e-6)
-        else:
-            final_hidden = x
-
+        # --- Final output layer normalization ---
+        final_hidden = self._apply_final_normalization(x)
         layer_logits["output"] = model.lm_head(final_hidden)
         return layer_logits
 
+    # -----------------
+    # Normalization utilities
+    # -----------------
+    def _apply_normalization(self, tensor: torch.Tensor, block) -> torch.Tensor:
+        """Select normalization rule per mode for intermediate layers."""
+        mode = self.normalization_mode
+        if mode == "none":
+            return tensor
+        elif mode == "model":
+            return block.post_attention_layernorm(tensor)
+        elif mode == "unit_l2":
+            return tensor / (tensor.norm(dim=-1, keepdim=True) + 1e-6)
+        elif mode == "unit_rms":
+            return self.model.model.norm(tensor)
+        else:
+            raise ValueError(f"Unknown normalization_mode: {mode}")
 
     def _normalize_for_mode(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Applies normalization according to selected mode."""
-        if self.normalization_mode == "none":
+        """Normalize subblock outputs consistently with the active mode."""
+        mode = self.normalization_mode
+        if mode in ("none", "model"):
             return tensor
-        elif self.normalization_mode == "model":
-            # just for consistency; model norms handled in block
-            return tensor
-        elif self.normalization_mode == "unit":
+        elif mode == "unit_l2":
             return tensor / (tensor.norm(dim=-1, keepdim=True) + 1e-6)
+        elif mode == "unit_rms":
+            return self.model.model.norm(tensor)
         else:
             return tensor
 
+    def _apply_final_normalization(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Apply the appropriate normalization to the final hidden state."""
+        mode = self.normalization_mode
+        if mode in ("none", "model"):
+            return self.model.model.norm(tensor)
+        elif mode == "unit_l2":
+            return tensor / (tensor.norm(dim=-1, keepdim=True) + 1e-6)
+        elif mode == "unit_rms":
+            return self.model.model.norm(tensor)
+        else:
+            return tensor
 
+    # -----------------
+    # Stack and utility
+    # -----------------
     @staticmethod
     def stack_layer_logits(
         layer_dict: Dict[str, torch.Tensor],
@@ -293,16 +296,17 @@ def _run_logit_lens_batch(
     """
     Run the logit lens on a batch of prompts and collect logits per layer.
 
-    Automatically respects the normalization mode defined in `lens.normalization_mode`:
+    Automatically applies the normalization mode defined in `lens.normalization_mode`:
         - "none": raw hidden states (Nostalgebraist)
         - "model": use model’s RMSNorm per transformer block
-        - "unit": normalize hidden states to unit length
+        - "unit_l2": L2-normalize hidden states per token
+        - "unit_rms": apply the model’s final RMSNorm at every layer (LogitLens4LLMs)
     """
     model = lens.model
     tokenizer = lens.tokenizer
     model.eval()
-
     device = get_model_device(model)
+
     vocab_size = getattr(tokenizer, "vocab_size", None) or getattr(model.lm_head, "out_features", None)
 
     # ---- Tokenize ----
@@ -317,7 +321,7 @@ def _run_logit_lens_batch(
     batch_size, seq_len = inputs.input_ids.shape
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
 
-    # ---- (Optional) RoPE embeddings ----
+    # ---- (Optional) Rotary embeddings ----
     position_embeddings = None
     if hasattr(model.model, "rotary_emb"):
         try:
@@ -334,6 +338,7 @@ def _run_logit_lens_batch(
         block_kwargs = {"position_embeddings": position_embeddings} if position_embeddings is not None else {"position_ids": position_ids}
 
         if lens.include_subblocks:
+            # --- Subblock probing ---
             attn_in = block.input_layernorm(x)
             attn_out = block.self_attn(attn_in, **block_kwargs)[0]
             attn_hidden = x + attn_out
@@ -342,48 +347,29 @@ def _run_logit_lens_batch(
             mlp_out = block.mlp(mlp_in)
             block_out = attn_hidden + mlp_out
 
-            # --- Normalization selection ---
-            if lens.normalization_mode == "none":
-                normed = block_out
-            elif lens.normalization_mode == "model":
-                normed = block.post_attention_layernorm(block_out)
-            elif lens.normalization_mode == "unit":
-                normed = block_out / (block_out.norm(dim=-1, keepdim=True) + 1e-6)
-            else:
-                raise ValueError(f"Unknown normalization mode: {lens.normalization_mode}")
+            # --- Normalization according to mode ---
+            normed = lens._apply_normalization(block_out, block)
 
             # --- Subblock projections ---
-            batch_layer_logits[f"layer_{i}.self_attn"] = model.lm_head(
+            batch_layer_logits[f"layer.{i}.self_attn"] = model.lm_head(
                 lens._normalize_for_mode(attn_out)
             )
-            batch_layer_logits[f"layer_{i}.mlp"] = model.lm_head(
+            batch_layer_logits[f"layer.{i}.mlp"] = model.lm_head(
                 lens._normalize_for_mode(mlp_out)
             )
-            batch_layer_logits[f"layer_{i}.block_out"] = model.lm_head(normed)
-
+            batch_layer_logits[f"layer.{i}.block_out"] = model.lm_head(normed)
             x = block_out
 
         else:
+            # --- Whole block probing ---
             out = block(x, **block_kwargs)[0]
-
-            if lens.normalization_mode == "none":
-                normed = out
-            elif lens.normalization_mode == "model":
-                normed = block.post_attention_layernorm(out)
-            elif lens.normalization_mode == "unit":
-                normed = out / (out.norm(dim=-1, keepdim=True) + 1e-6)
-            else:
-                raise ValueError(f"Unknown normalization mode: {lens.normalization_mode}")
-
-            batch_layer_logits[f"layer_{i}"] = model.lm_head(normed)
+            normed = lens._apply_normalization(out, block)
+            batch_layer_logits[f"layer.{i}"] = model.lm_head(normed)
             x = out
 
-    # ---- Final RMSNorm or unit normalization ----
+    # ---- Final normalization ----
     if include_output:
-        if lens.normalization_mode in {"none", "model"}:
-            final_hidden = model.model.norm(x)
-        elif lens.normalization_mode == "unit":
-            final_hidden = x / (x.norm(dim=-1, keepdim=True) + 1e-6)
+        final_hidden = lens._apply_final_normalization(x)
         batch_layer_logits["output"] = model.lm_head(final_hidden)
 
     # ---- Mask special tokens ----
@@ -419,9 +405,7 @@ def _run_logit_lens_batch(
             logits_cur = logits[b, :true_len].float()
             if proj_precision == "fp16":
                 logits_cur = logits_cur.half()
-
-            # Drop final timestep
-            logits_cur = logits_cur[:-1]
+            logits_cur = logits_cur[:-1]  # Drop final timestep
 
             row = {
                 "prompt_id": b,
@@ -438,6 +422,7 @@ def _run_logit_lens_batch(
             rows.append(row)
 
     return pd.DataFrame(rows)
+
 
 
 
