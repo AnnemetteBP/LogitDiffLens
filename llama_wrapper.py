@@ -588,7 +588,7 @@ def run_logit_lens_autoregressive_batched(
             prompts=batch_prompts,
             dataset_name=dataset_name,
             proj_precision=proj_precision,
-            max_steps=max_steps,  # ← fixed here
+            max_steps=max_steps, 
             **kwargs,
         )
 
