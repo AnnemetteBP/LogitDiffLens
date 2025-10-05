@@ -17,7 +17,6 @@ def make_print_if_verbose(verbose: bool):
 # -----------------------------
 # Utility functions
 # -----------------------------
-
 def get_model_device(model: torch.nn.Module) -> torch.device:
     """Safely infer device even for quantized / bitsandbytes models."""
     try:
@@ -65,10 +64,6 @@ def mask_special_logits(logits_dict, tokenizer):
         logits[:, :, special_ids] = float("-inf")
     return logits_dict
 
-# -----------------------------
-# Core Wrapper
-# -----------------------------
-
 def load_model_and_tok(
     model_name: str,
     low_cpu_mem_usage: bool = True,
@@ -112,17 +107,48 @@ class BlockOutputWrapper(torch.nn.Module):
         return hidden, logits
 
 
+"""def ensure_rope_initialized_llama(self, model, device):
+ 
+    Initialize all rotary embeddings in the model, even under BitNet or quantized wrappers.
+
+    for name, module in model.named_modules():
+        if "rotary_emb" in name.lower():
+            inv_freq = getattr(module, "inv_freq", None)
+            if inv_freq is None or isinstance(inv_freq, type(None)):
+                dummy_pos = torch.arange(1, device=device).unsqueeze(0)
+                try:
+                    module._dynamic_frequency_update(dummy_pos, device=device)
+                    print(f"[init] Initialized RoPE in {name}")
+                except Exception as e:
+                    print(f"[warn] Failed to init RoPE in {name}: {e}")
+            else:
+                # sanity check
+                if isinstance(inv_freq, torch.Tensor):
+                    print(f"[ok] {name} already has inv_freq tensor")
+                else:
+                    print(f"[warn] {name} inv_freq type: {type(inv_freq)}")
+    return model
+
+for n, m in lens.model.named_modules():
+    if "rotary_emb" in n:
+        print(n, type(getattr(m, "inv_freq", None)))"""
+
+
+# -----------------------------
+# Core Wrapper
+# -----------------------------
+from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+
+
 class LlamaPromptLens:
     """
-    Unified Logit Lens interface for LLaMA-style models.
+    Unified Logit Lens interface for LLaMA/BitNet-style models.
 
     Normalization modes:
-      - "none":  Nostalgebraist — raw hidden states (no per-layer normalization, only final RMSNorm)
-                  Ref: https://www.lesswrong.com/posts/AcKRB8wDpdaN6v6ru/interpreting-gpt-the-logit-lens
-      - "model": True-model internal states — use model’s own RMSNorms (`input_layernorm` / `post_attention_layernorm`)
-      - "unit_l2": Normalize each hidden vector to unit L2 norm (heuristic, scale-invariant)
-      - "unit_rms": Apply model’s *final RMSNorm weights* at every layer (faithful to LogitLens4LLMs, Eq. 1)
-                    Ref: https://arxiv.org/abs/2503.11667
+      - "none":      raw hidden states (no per-layer normalization)
+      - "model":     use model’s own layernorms (faithful to internal flow)
+      - "unit_l2":   normalize hidden states to unit L2 norm
+      - "unit_rms":  apply final RMSNorm weights at every layer
     """
 
     def __init__(
@@ -132,11 +158,13 @@ class LlamaPromptLens:
         include_subblocks: bool = False,
         device: Optional[str] = None,
     ):
+        # ---- Load model and tokenizer ----
         self.model, self.tokenizer = load_model_and_tok(model_id)
         self.device = device or get_model_device(self.model)
         self.normalization_mode = normalization_mode
         self.include_subblocks = include_subblocks
 
+        # ---- Architecture detection ----
         self.is_quantized = is_quantized_model(self.model)
         self.is_bitnet = is_bitnet_model(self.model)
         self.arch = detect_architecture(self.model)
@@ -149,11 +177,41 @@ class LlamaPromptLens:
         else:
             print("Standard FP16 or FP32 model.")
 
+        # ---- Initialize any uninitialized RoPE modules ----
+        for name, module in self.model.named_modules():
+            if isinstance(module, LlamaRotaryEmbedding):
+                if getattr(module, "inv_freq", None) is None:
+                    dummy_pos = torch.arange(1, device=self.device).unsqueeze(0)
+                    try:
+                        module._dynamic_frequency_update(dummy_pos, device=self.device)
+                        print(f"[init] Initialized missing inv_freq in {name}")
+                    except Exception as e:
+                        print(f"[warn] Could not init RoPE in {name}: {e}")
+
+        # ---- Report RoPE types for debugging ----
+        for name, module in self.model.named_modules():
+            rope = getattr(getattr(module, "self_attn", None), "rotary_emb", None)
+            if rope is None:
+                continue
+            if isinstance(rope, LlamaRotaryEmbedding):
+                print(f"[ok] {name}.self_attn.rotary_emb is LlamaRotaryEmbedding (old API)")
+            elif isinstance(rope, torch.Tensor):
+                print(f"[ok] {name}.self_attn.rotary_emb is tensor (new API)")
+            elif isinstance(rope, tuple):
+                print(f"[ok] {name}.self_attn.rotary_emb is tuple (cos,sin)")
+            else:
+                print(f"[warn] {name}.self_attn.rotary_emb unexpected type: {type(rope)}")
+
+        # ---- Ensure tokenizer special tokens ----
         self._ensure_special_tokens()
 
+        # ---- Move to device if safe ----
         if not self.is_quantized and not self.is_bitnet:
             self.model = self.model.to(self.device)
 
+    # ------------------------
+    # Token + model prep
+    # ------------------------
     def _ensure_special_tokens(self):
         specials = {}
         if not getattr(self.tokenizer, "bos_token", None):
@@ -167,69 +225,27 @@ class LlamaPromptLens:
             if hasattr(self.model, "resize_token_embeddings"):
                 self.model.resize_token_embeddings(len(self.tokenizer))
 
-    # -----------------
-    # Probe (single prompt)
-    # -----------------
-    @torch.no_grad()
-    def probe_prompt(self, prompt: str) -> Dict[str, torch.Tensor]:
-        model = self.model
-        tokenizer = self.tokenizer
-        model_device = get_model_device(model)
-        model.eval()
-
-        inputs = tokenizer(prompt, return_tensors="pt").to(model_device)
-        x = model.model.embed_tokens(inputs.input_ids)
-        layer_logits = {"embed_tokens": model.lm_head(x)}
-
-        for i, block in enumerate(model.model.layers):
-            if self.include_subblocks:
-                # --- Attention sublayer ---
-                attn_in = block.input_layernorm(x)
-                attn_out = block.self_attn(attn_in)[0]
-                attn_hidden = x + attn_out
-
-                # --- MLP sublayer ---
-                mlp_in = block.post_attention_layernorm(attn_hidden)
-                mlp_out = block.mlp(mlp_in)
-                block_out = attn_hidden + mlp_out
-
-                # --- Normalization selection ---
-                normed = self._apply_normalization(block_out, block)
-
-                # --- Projections for subcomponents ---
-                layer_logits[f"layer.{i}.self_attn"] = model.lm_head(self._normalize_for_mode(attn_out))
-                layer_logits[f"layer.{i}.mlp"] = model.lm_head(self._normalize_for_mode(mlp_out))
-                layer_logits[f"layer.{i}.block_out"] = model.lm_head(normed)
-                x = block_out
-
-            else:
-                # --- Whole block output probing ---
-                out = block(x)[0]
-                normed = self._apply_normalization(out, block)
-                layer_logits[f"layer.{i}"] = model.lm_head(normed)
-                x = out
-
-        # --- Final output layer normalization ---
-        final_hidden = self._apply_final_normalization(x)
-        layer_logits["output"] = model.lm_head(final_hidden)
-        return layer_logits
 
     # -----------------
     # Normalization utilities
     # -----------------
-    def _apply_normalization(self, tensor: torch.Tensor, block) -> torch.Tensor:
-        """Select normalization rule per mode for intermediate layers."""
+    def _apply_normalization(self, tensor, block):
         mode = self.normalization_mode
         if mode == "none":
+            # raw lens: no normalization
             return tensor
         elif mode == "model":
+            # model-faithful normalization: use the model’s internal post-attention norm
             return block.post_attention_layernorm(tensor)
         elif mode == "unit_l2":
+            # heuristic normalization
             return tensor / (tensor.norm(dim=-1, keepdim=True) + 1e-6)
         elif mode == "unit_rms":
-            return self.model.model.norm(tensor)
+            # apply final model RMSNorm weights at every layer
+            return self.model.base_model.norm(tensor)
         else:
             raise ValueError(f"Unknown normalization_mode: {mode}")
+
 
     def _normalize_for_mode(self, tensor: torch.Tensor) -> torch.Tensor:
         """Normalize subblock outputs consistently with the active mode."""
@@ -239,21 +255,19 @@ class LlamaPromptLens:
         elif mode == "unit_l2":
             return tensor / (tensor.norm(dim=-1, keepdim=True) + 1e-6)
         elif mode == "unit_rms":
-            return self.model.model.norm(tensor)
+            return self.model.base_model.norm(tensor)
         else:
             return tensor
 
-    def _apply_final_normalization(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Apply the appropriate normalization to the final hidden state."""
+    def _apply_final_normalization(self, tensor):
         mode = self.normalization_mode
         if mode in ("none", "model"):
-            return self.model.model.norm(tensor)
+            # the model always applies its final RMSNorm before logits
+            return self.model.base_model.norm(tensor)
         elif mode == "unit_l2":
             return tensor / (tensor.norm(dim=-1, keepdim=True) + 1e-6)
         elif mode == "unit_rms":
-            return self.model.model.norm(tensor)
-        else:
-            return tensor
+            return self.model.base_model.norm(tensor)
 
     # -----------------
     # Stack and utility
@@ -277,14 +291,54 @@ class LlamaPromptLens:
         stacked = torch.stack(tensors, dim=0)
         return stacked, names
 
+def _ensure_rope_initialized(model, device):
+    """Ensure all LlamaRotaryEmbedding modules have valid inv_freq."""
+    from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+    for name, module in model.named_modules():
+        if isinstance(module, LlamaRotaryEmbedding):
+            if getattr(module, "inv_freq", None) is None:
+                dummy_pos = torch.arange(1, device=device).unsqueeze(0)
+                try:
+                    module._dynamic_frequency_update(dummy_pos, device=device)
+                    print(f"[init] Initialized inv_freq in {name}")
+                except Exception as e:
+                    print(f"[warn] Failed to init inv_freq in {name}: {e}")
+
+def _ensure_rope_support(model, device):
+    """
+    Detects and adapts for different RoPE implementations:
+    - Old API: LlamaRotaryEmbedding (callable)
+    - New API: tensor-based (precomputed cos/sin)
+    Returns tuple (use_external_embeddings, rope_source)
+    """
+    first_attn = model.base_model.layers[0].self_attn
+    rope = getattr(first_attn, "rotary_emb", None)
+
+    if rope is None:
+        print("[warn] No rotary_emb found in first attention block.")
+        return False, None
+
+    if isinstance(rope, torch.Tensor):
+        print("[info] RoPE is a tensor — using external embeddings (new API).")
+        return True, rope  # tensor already
+    elif hasattr(rope, "forward"):  # old LlamaRotaryEmbedding
+        print("[info] RoPE is a callable module — using legacy API.")
+        return False, rope
+    else:
+        print(f"[warn] Unknown RoPE type: {type(rope)}")
+        return False, rope
 
 # -----------------
 # Batched version
 # -----------------
+import torch
+import pandas as pd
+from typing import Optional
+
 @torch.no_grad()
 def _run_logit_lens_batch(
-    lens: LlamaPromptLens,
-    prompts: List[str],
+    lens,
+    prompts: list[str],
     dataset_name: str = "default",
     mask_special: bool = True,
     include_embed_tokens: bool = True,
@@ -292,22 +346,23 @@ def _run_logit_lens_batch(
     proj_precision: Optional[str] = None,
     pad_to_max_length: bool = False,
     max_len: Optional[int] = 20,
+    save_path: Optional[str] = None,
 ):
     """
-    Run the logit lens on a batch of prompts and collect logits per layer.
-
-    Automatically applies the normalization mode defined in `lens.normalization_mode`:
-        - "none": raw hidden states (Nostalgebraist)
-        - "model": use model’s RMSNorm per transformer block
-        - "unit_l2": L2-normalize hidden states per token
-        - "unit_rms": apply the model’s final RMSNorm at every layer (LogitLens4LLMs)
+    Run the logit lens on a batch of prompts.
+    Works with subblocks (attn/MLP) or whole blocks.
+    Fully compatible with HF ≥4.46 (new RoPE API).
+    BitNet + standard LLaMA-safe.
     """
+
     model = lens.model
     tokenizer = lens.tokenizer
-    model.eval()
     device = get_model_device(model)
+    model.eval()
 
-    vocab_size = getattr(tokenizer, "vocab_size", None) or getattr(model.lm_head, "out_features", None)
+    # ---- Ensure RoPE initialized & detect type ----
+    _ensure_rope_initialized(model, device)
+    use_external_rope, rope_module = _ensure_rope_support(model, device)
 
     # ---- Tokenize ----
     inputs = tokenizer(
@@ -321,48 +376,48 @@ def _run_logit_lens_batch(
     batch_size, seq_len = inputs.input_ids.shape
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
 
-    # ---- (Optional) Rotary embeddings ----
-    position_embeddings = None
-    if hasattr(model.model, "rotary_emb"):
-        try:
-            cos, sin = model.model.rotary_emb(model.model.embed_tokens(inputs.input_ids), position_ids)
-            position_embeddings = (cos, sin)
-        except Exception:
-            position_embeddings = None
-
-    # ---- Forward ----
-    x = model.model.embed_tokens(inputs.input_ids)
+    # ---- Embed ----
+    x = model.base_model.embed_tokens(inputs.input_ids)
     batch_layer_logits = {"embed_tokens": model.lm_head(x)}
 
-    for i, block in enumerate(model.model.layers):
-        block_kwargs = {"position_embeddings": position_embeddings} if position_embeddings is not None else {"position_ids": position_ids}
+    # ---- Traverse transformer layers ----
+    for i, block in enumerate(model.base_model.layers):
 
         if lens.include_subblocks:
-            # --- Subblock probing ---
+            # --- Attention sublayer ---
             attn_in = block.input_layernorm(x)
-            attn_out = block.self_attn(attn_in, **block_kwargs)[0]
+            with torch.autocast(device_type=device.type, enabled=False):
+                if use_external_rope:
+                    attn_out = block.self_attn(attn_in, position_embeddings=rope_module)[0]
+                else:
+                    attn_out = block.self_attn(attn_in, position_ids=position_ids)[0]
+
             attn_hidden = x + attn_out
 
+            # --- MLP sublayer ---
             mlp_in = block.post_attention_layernorm(attn_hidden)
             mlp_out = block.mlp(mlp_in)
             block_out = attn_hidden + mlp_out
 
-            # --- Normalization according to mode ---
             normed = lens._apply_normalization(block_out, block)
 
-            # --- Subblock projections ---
-            batch_layer_logits[f"layer.{i}.self_attn"] = model.lm_head(
-                lens._normalize_for_mode(attn_out)
-            )
-            batch_layer_logits[f"layer.{i}.mlp"] = model.lm_head(
-                lens._normalize_for_mode(mlp_out)
-            )
-            batch_layer_logits[f"layer.{i}.block_out"] = model.lm_head(normed)
+            # --- Logit projections ---
+            batch_layer_logits[f"layer.{i}.attn.delta"] = model.lm_head(lens._normalize_for_mode(attn_out))
+            batch_layer_logits[f"layer.{i}.attn.post"]  = model.lm_head(lens._normalize_for_mode(attn_hidden))
+            batch_layer_logits[f"layer.{i}.mlp.delta"]  = model.lm_head(lens._normalize_for_mode(mlp_out))
+            batch_layer_logits[f"layer.{i}.mlp.post"]   = model.lm_head(lens._normalize_for_mode(block_out))
+            batch_layer_logits[f"layer.{i}.block_out"]  = model.lm_head(normed)
+
             x = block_out
 
         else:
             # --- Whole block probing ---
-            out = block(x, **block_kwargs)[0]
+            with torch.autocast(device_type=device.type, enabled=False):
+                if use_external_rope:
+                    out = block(x, position_embeddings=rope_module)[0]
+                else:
+                    out = block(x, position_ids=position_ids)[0]
+
             normed = lens._apply_normalization(out, block)
             batch_layer_logits[f"layer.{i}"] = model.lm_head(normed)
             x = out
@@ -375,12 +430,13 @@ def _run_logit_lens_batch(
     # ---- Mask special tokens ----
     if mask_special:
         special_ids = [
-            tokenizer.bos_token_id,
-            tokenizer.eos_token_id,
-            tokenizer.pad_token_id,
+            t for t in [
+                tokenizer.bos_token_id,
+                tokenizer.eos_token_id,
+                tokenizer.pad_token_id
+            ] if t is not None
         ]
-        special_ids = [sid for sid in special_ids if sid is not None]
-        for lname, logits in batch_layer_logits.items():
+        for logits in batch_layer_logits.values():
             logits[:, :, special_ids] = float("-inf")
 
     # ---- Stack all layers ----
@@ -400,30 +456,27 @@ def _run_logit_lens_batch(
             if tokenizer.pad_token_id is not None
             else seq_len
         )
-
         for li, (lname, logits) in enumerate(zip(layer_names, stacked)):
-            logits_cur = logits[b, :true_len].float()
+            logits_cur = logits[b, :true_len].float().cpu()
             if proj_precision == "fp16":
                 logits_cur = logits_cur.half()
-            logits_cur = logits_cur[:-1]  # Drop final timestep
-
-            row = {
+            logits_cur = logits_cur[:-1]
+            rows.append({
                 "prompt_id": b,
                 "prompt_text": prompts[b],
                 "dataset": dataset_name,
-                "vocab_size": vocab_size,
                 "layer_index": li,
                 "layer_name": lname,
                 "input_ids": input_ids_seq,
                 "target_ids": input_ids_seq[1:true_len],
                 "logits": logits_cur,
                 "position": torch.arange(true_len - 1),
-            }
-            rows.append(row)
+            })
 
-    return pd.DataFrame(rows)
-
-
+    df = pd.DataFrame(rows)
+    if save_path:
+        torch.save(df, save_path)
+    return df
 
 
 @torch.no_grad()
@@ -562,6 +615,8 @@ def run_logit_lens_batched(
     """
         Run prompt probing lens
     """
+    import gc
+
     os.makedirs(save_dir, exist_ok=True)
     for i, start in enumerate(range(0, len(prompts), batch_size)):
         batch_prompts = prompts[start : start + batch_size]
@@ -578,7 +633,11 @@ def run_logit_lens_batched(
             )
             torch.save(df_batch, batch_path)
             print(f"[✓] Saved batch {i}: {batch_path}")
-        torch.cuda.empty_cache()
+        
+        del df_batch, batch_prompts
+        gc.collect()                      # clears CPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache() 
     print(f"All {len(prompts)} prompts processed.")
 
 
