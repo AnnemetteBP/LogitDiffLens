@@ -107,33 +107,6 @@ class BlockOutputWrapper(torch.nn.Module):
         return hidden, logits
 
 
-"""def ensure_rope_initialized_llama(self, model, device):
- 
-    Initialize all rotary embeddings in the model, even under BitNet or quantized wrappers.
-
-    for name, module in model.named_modules():
-        if "rotary_emb" in name.lower():
-            inv_freq = getattr(module, "inv_freq", None)
-            if inv_freq is None or isinstance(inv_freq, type(None)):
-                dummy_pos = torch.arange(1, device=device).unsqueeze(0)
-                try:
-                    module._dynamic_frequency_update(dummy_pos, device=device)
-                    print(f"[init] Initialized RoPE in {name}")
-                except Exception as e:
-                    print(f"[warn] Failed to init RoPE in {name}: {e}")
-            else:
-                # sanity check
-                if isinstance(inv_freq, torch.Tensor):
-                    print(f"[ok] {name} already has inv_freq tensor")
-                else:
-                    print(f"[warn] {name} inv_freq type: {type(inv_freq)}")
-    return model
-
-for n, m in lens.model.named_modules():
-    if "rotary_emb" in n:
-        print(n, type(getattr(m, "inv_freq", None)))"""
-
-
 # -----------------------------
 # Core Wrapper
 # -----------------------------
