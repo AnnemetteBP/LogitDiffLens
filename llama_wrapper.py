@@ -351,7 +351,25 @@ def _run_logit_lens_batch(
 
     # ---- Embed ----
     x = model.base_model.embed_tokens(inputs.input_ids)
-    batch_layer_logits = {"embed_tokens": model.lm_head(x)}
+    embed_logits = model.lm_head(x)
+    #embed_logits = torch.clamp(embed_logits, min=-80.0, max=80.0)
+    # Compute quantile safely in chunks to avoid huge flattening
+    abs_vals = embed_logits.abs()
+    q = 0.99
+    num_samples = 1_000_000  # sample subset instead of full tensor
+
+    if abs_vals.numel() > num_samples:
+        # randomly sample a subset for quantile estimation
+        idx = torch.randint(0, abs_vals.numel(), (num_samples,), device=abs_vals.device)
+        sample = abs_vals.flatten()[idx]
+        limit = torch.quantile(sample, q).item()
+    else:
+        limit = torch.quantile(abs_vals.flatten(), q).item()
+
+    embed_logits = torch.clamp(embed_logits, min=-limit, max=limit)
+    print(f"[embed clamp] adaptive limit≈{limit:.3f}")
+    batch_layer_logits = {"embed_tokens": embed_logits}
+    #batch_layer_logits = {"embed_tokens": model.lm_head(x)}
 
     # ---- Traverse transformer layers ----
     for i, block in enumerate(model.base_model.layers):
@@ -385,15 +403,38 @@ def _run_logit_lens_batch(
 
         else:
             # --- Whole block probing ---
-            with torch.autocast(device_type=device.type, enabled=False):
-                if use_external_rope:
-                    out = block(x, position_embeddings=rope_module)[0]
-                else:
-                    out = block(x, position_ids=position_ids)[0]
+            if lens.normalization_mode == "none":
+                # =============== Nostalgebraist-style lens ===============
+                # Bypass internal norms: just raw residual stream
+                with torch.autocast(device_type=device.type, enabled=False):
+                    if use_external_rope:
+                        attn_out = block.self_attn(x, position_embeddings=rope_module)[0]
+                    else:
+                        attn_out = block.self_attn(x, position_ids=position_ids)[0]
 
-            normed = lens._apply_normalization(out, block)
+                attn_hidden = x + attn_out
+
+                with torch.autocast(device_type=device.type, enabled=False):
+                    mlp_out = block.mlp(attn_hidden)
+
+                out = attn_hidden + mlp_out
+                normed = out  # raw (no internal or post-attn norm)
+                # =========================================================
+
+            else:
+                # =============== Faithful (model) lens ===============
+                # Uses the model’s actual forward (includes layer norms)
+                with torch.autocast(device_type=device.type, enabled=False):
+                    if use_external_rope:
+                        out = block(x, position_embeddings=rope_module)[0]
+                    else:
+                        out = block(x, position_ids=position_ids)[0]
+                normed = lens._apply_normalization(out, block)
+                # ======================================================
+
             batch_layer_logits[f"layer.{i}"] = model.lm_head(normed)
             x = out
+
 
     # ---- Final normalization ----
     if include_output:
