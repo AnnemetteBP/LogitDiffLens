@@ -216,53 +216,88 @@ class LlamaPromptLens:
         elif mode == "unit_rms":
             # apply final model RMSNorm weights at every layer
             return self.model.base_model.norm(tensor)
+        elif mode == "non_param_rms":
+            eps = 1e-6
+            return tensor / (tensor.pow(2).mean(dim=-1, keepdim=True).add(eps).sqrt())
         else:
             raise ValueError(f"Unknown normalization_mode: {mode}")
 
-
-    def _normalize_for_mode(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Normalize subblock outputs consistently with the active mode."""
+    def _normalize_for_mode(self, x: torch.Tensor) -> torch.Tensor:
         mode = self.normalization_mode
-        if mode in ("none", "model"):
-            return tensor
-        elif mode == "unit_l2":
-            return tensor / (tensor.norm(dim=-1, keepdim=True) + 1e-6)
+        eps = 1e-6
+        if mode == "none":
+            return x
+        elif mode == "model":
+            return x  # only let the block norms run inside the model
+        elif mode in ("unit_l2", "non_param_rms"):
+            return x / (x.pow(2).mean(dim=-1, keepdim=True).add(eps).sqrt())
         elif mode == "unit_rms":
-            return self.model.base_model.norm(tensor)
+            # learned final norm, scaled down so it doesn’t blow up
+            w = self.model.base_model.norm.weight
+            scale = w.mean()
+            return (self.model.base_model.norm(x)) / scale
         else:
-            return tensor
+            raise ValueError(f"Unknown normalization_mode: {mode}")
 
-    def _apply_final_normalization(self, tensor):
-        mode = self.normalization_mode
-        if mode in ("none", "model"):
-            # the model always applies its final RMSNorm before logits
-            return self.model.base_model.norm(tensor)
-        elif mode == "unit_l2":
-            return tensor / (tensor.norm(dim=-1, keepdim=True) + 1e-6)
-        elif mode == "unit_rms":
-            return self.model.base_model.norm(tensor)
+    def _apply_final_normalization(self, x):
+        # always use the model’s own final RMSNorm for the real output
+        return self.model.base_model.norm(x)
+
+
 
     # -----------------
     # Stack and utility
-    # -----------------
-    @staticmethod
     def stack_layer_logits(
-        layer_dict: Dict[str, torch.Tensor],
+        self,
+        layer_dict: dict[str, torch.Tensor],
         keep_on_device: bool = True,
         skip_embed: bool = False,
         include_output: bool = True,
+        model=None
     ):
+        """
+        Safely stacks vocab-projected logits while keeping hidden-space activations separate.
+        Returns two dicts: stacked vocab logits + unstacked hidden tensors.
+        """
         names, tensors = [], []
+        hidden_dict = {}
+        vocab_dim = None
+
         for name, logits in layer_dict.items():
+            # Optionally skip embedding and output layers
             if skip_embed and name == "embed_tokens":
+                print(f"[skip stack] Skipping embeddings: {name}")
                 continue
             if not include_output and name == "output":
+                print(f"[skip stack] Skipping output layer: {name}")
                 continue
+
+            # Detect vocab dimension automatically from lm_head
+            if vocab_dim is None:
+                try:
+                    vocab_dim = logits.shape[-1]
+                except Exception:
+                    continue
+
+            # If shape doesn't match vocab size (e.g. hidden states), store separately
+            if logits.shape[-1] != model.lm_head.out_features:
+                hidden_dict[name] = logits.detach().cpu()
+                print(f"[hidden] {name} shape={tuple(logits.shape)} — stored separately.")
+                continue
+
+            # Otherwise, this is a vocab-projected logit tensor
             t = logits if keep_on_device else logits.detach().cpu()
             tensors.append(t)
             names.append(name)
+
+        if len(tensors) == 0:
+            print("[warn] No vocab-sized tensors to stack; returning only hidden_dict.")
+            return None, None, hidden_dict
+
         stacked = torch.stack(tensors, dim=0)
-        return stacked, names
+        return stacked, names, hidden_dict
+
+
 
 def _ensure_rope_initialized(model, device):
     """Ensure all LlamaRotaryEmbedding modules have valid inv_freq."""
@@ -301,10 +336,25 @@ def _ensure_rope_support(model, device):
         print(f"[warn] Unknown RoPE type: {type(rope)}")
         return False, rope
 
+def unapply_rope(x, rope_module, position_ids):
+    """
+    Undo RoPE rotation for activations that were transformed by LlamaRotaryEmbedding.
+    Works only for old RoPE API (module form).
+    """
+    # Compute cos/sin as the model would
+    cos, sin = rope_module(position_ids, seq_len=x.shape[-2])
+    # Expand to match hidden dims
+    cos, sin = cos.to(x.device), sin.to(x.device)
+    # Unrotate
+    x1, x2 = x[..., ::2], x[..., 1::2]
+    unrot = torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], dim=-1)
+    return unrot
+
+
 # -----------------
 # Batched version
-# -----------------
 import torch
+import torch.nn.functional as F
 import pandas as pd
 from typing import Optional
 
@@ -323,21 +373,24 @@ def _run_logit_lens_batch(
 ):
     """
     Run the logit lens on a batch of prompts.
-    Works with subblocks (attn/MLP) or whole blocks.
-    Fully compatible with HF ≥4.46 (new RoPE API).
-    BitNet + standard LLaMA-safe.
+    Handles both old (module) and new (tensor) RoPE APIs.
+    Safe with all normalization modes and embedding handling.
     """
 
+    # ----------------------------------------------------
+    #  Setup
+    # ----------------------------------------------------
     model = lens.model
     tokenizer = lens.tokenizer
     device = get_model_device(model)
     model.eval()
 
-    # ---- Ensure RoPE initialized & detect type ----
     _ensure_rope_initialized(model, device)
     use_external_rope, rope_module = _ensure_rope_support(model, device)
 
-    # ---- Tokenize ----
+    # ----------------------------------------------------
+    #  Tokenize inputs
+    # ----------------------------------------------------
     inputs = tokenizer(
         prompts,
         return_tensors="pt",
@@ -349,31 +402,66 @@ def _run_logit_lens_batch(
     batch_size, seq_len = inputs.input_ids.shape
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
 
-    # ---- Embed ----
+    # ----------------------------------------------------
+    #  Helper: unapply RoPE (old API only)
+    # ----------------------------------------------------
+    def unapply_rope(x, rope_module, position_ids):
+        """Undo rotary embedding rotation (old LlamaRotaryEmbedding API)."""
+        try:
+            cos, sin = rope_module(position_ids, seq_len=x.shape[1])
+            cos, sin = cos.to(x.device), sin.to(x.device)
+            x1, x2 = x[..., ::2], x[..., 1::2]
+            unrot = torch.cat([x1 * cos + x2 * sin,
+                               -x1 * sin + x2 * cos], dim=-1)
+            return unrot
+        except Exception as e:
+            print(f"[warn] Failed to unapply RoPE: {e}")
+            return x  # fallback to unchanged activations
+
+    # ----------------------------------------------------
+    #  Safe helper for logit projection
+    # ----------------------------------------------------
+    def safe_project_to_logits(x):
+        """Numerically safe logit projection with normalization & clamping."""
+        x = x - x.mean(dim=-1, keepdim=True)
+        x = x / (x.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt())
+        logits = model.lm_head(x)
+        return logits.clamp(-80, 80)
+
+    # ----------------------------------------------------
+    #  Embedding layer
+    # ----------------------------------------------------
     x = model.base_model.embed_tokens(inputs.input_ids)
-    embed_logits = model.lm_head(x)
-    #embed_logits = torch.clamp(embed_logits, min=-80.0, max=80.0)
-    # Compute quantile safely in chunks to avoid huge flattening
-    abs_vals = embed_logits.abs()
-    q = 0.99
-    num_samples = 1_000_000  # sample subset instead of full tensor
+    batch_layer_logits = {}
 
-    if abs_vals.numel() > num_samples:
-        # randomly sample a subset for quantile estimation
-        idx = torch.randint(0, abs_vals.numel(), (num_samples,), device=abs_vals.device)
-        sample = abs_vals.flatten()[idx]
-        limit = torch.quantile(sample, q).item()
+    if include_embed_tokens:
+        # Detect if weights are tied (then projection is valid)
+        tied = (
+            hasattr(model, "tie_word_embeddings") and model.tie_word_embeddings()
+        ) or (model.lm_head.weight.data_ptr() == model.base_model.embed_tokens.weight.data_ptr())
+
+        if tied:
+            print("[info] Tied embeddings detected — projecting embeddings via lm_head safely.")
+            embed_logits = safe_project_to_logits(x)
+            batch_layer_logits["embed_tokens"] = embed_logits
+        else:
+            print("[info] Untied embeddings detected — skipping lm_head projection.")
+            # Store normalized embeddings instead
+            normed_embed = x / (x.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt())
+            batch_layer_logits["embed_tokens"] = normed_embed
     else:
-        limit = torch.quantile(abs_vals.flatten(), q).item()
+        print("[info] Skipped embedding layer entirely.")
 
-    embed_logits = torch.clamp(embed_logits, min=-limit, max=limit)
-    print(f"[embed clamp] adaptive limit≈{limit:.3f}")
-    batch_layer_logits = {"embed_tokens": embed_logits}
-    #batch_layer_logits = {"embed_tokens": model.lm_head(x)}
+    print(f"[debug] Using {'external (tensor)' if use_external_rope else 'legacy (module)'} RoPE API.")
+    if not use_external_rope:
+        print("[debug] RoPE unrotation will be applied to attention outputs.")
+    else:
+        print("[debug] Skipping unrotation (new RoPE API already aligned).")
 
-    # ---- Traverse transformer layers ----
+    # ----------------------------------------------------
+    #  Traverse transformer layers
+    # ----------------------------------------------------
     for i, block in enumerate(model.base_model.layers):
-
         if lens.include_subblocks:
             # --- Attention sublayer ---
             attn_in = block.input_layernorm(x)
@@ -382,6 +470,12 @@ def _run_logit_lens_batch(
                     attn_out = block.self_attn(attn_in, position_embeddings=rope_module)[0]
                 else:
                     attn_out = block.self_attn(attn_in, position_ids=position_ids)[0]
+
+            # --- Undo RoPE rotation if using legacy API ---
+            if not use_external_rope and rope_module is not None:
+                attn_unrot = unapply_rope(attn_out, rope_module, position_ids)
+            else:
+                attn_unrot = attn_out
 
             attn_hidden = x + attn_out
 
@@ -393,7 +487,7 @@ def _run_logit_lens_batch(
             normed = lens._apply_normalization(block_out, block)
 
             # --- Logit projections ---
-            batch_layer_logits[f"layer.{i}.attn.delta"] = model.lm_head(lens._normalize_for_mode(attn_out))
+            batch_layer_logits[f"layer.{i}.attn.delta"] = model.lm_head(lens._normalize_for_mode(attn_unrot))
             batch_layer_logits[f"layer.{i}.attn.post"]  = model.lm_head(lens._normalize_for_mode(attn_hidden))
             batch_layer_logits[f"layer.{i}.mlp.delta"]  = model.lm_head(lens._normalize_for_mode(mlp_out))
             batch_layer_logits[f"layer.{i}.mlp.post"]   = model.lm_head(lens._normalize_for_mode(block_out))
@@ -404,44 +498,41 @@ def _run_logit_lens_batch(
         else:
             # --- Whole block probing ---
             if lens.normalization_mode == "none":
-                # =============== Nostalgebraist-style lens ===============
-                # Bypass internal norms: just raw residual stream
                 with torch.autocast(device_type=device.type, enabled=False):
                     if use_external_rope:
                         attn_out = block.self_attn(x, position_embeddings=rope_module)[0]
                     else:
                         attn_out = block.self_attn(x, position_ids=position_ids)[0]
+                if not use_external_rope and rope_module is not None:
+                    attn_out = unapply_rope(attn_out, rope_module, position_ids)
 
                 attn_hidden = x + attn_out
-
                 with torch.autocast(device_type=device.type, enabled=False):
                     mlp_out = block.mlp(attn_hidden)
-
                 out = attn_hidden + mlp_out
-                normed = out  # raw (no internal or post-attn norm)
-                # =========================================================
-
+                normed = out  # raw
             else:
-                # =============== Faithful (model) lens ===============
-                # Uses the model’s actual forward (includes layer norms)
                 with torch.autocast(device_type=device.type, enabled=False):
                     if use_external_rope:
                         out = block(x, position_embeddings=rope_module)[0]
                     else:
                         out = block(x, position_ids=position_ids)[0]
                 normed = lens._apply_normalization(out, block)
-                # ======================================================
 
             batch_layer_logits[f"layer.{i}"] = model.lm_head(normed)
             x = out
 
-
-    # ---- Final normalization ----
+    # ----------------------------------------------------
+    #  Final normalization
+    # ----------------------------------------------------
     if include_output:
         final_hidden = lens._apply_final_normalization(x)
         batch_layer_logits["output"] = model.lm_head(final_hidden)
+        print(f"[debug] Final hidden: mean={final_hidden.mean():.4f}, std={final_hidden.std():.4f}")
 
-    # ---- Mask special tokens ----
+    # ----------------------------------------------------
+    #  Mask special tokens
+    # ----------------------------------------------------
     if mask_special:
         special_ids = [
             t for t in [
@@ -450,18 +541,39 @@ def _run_logit_lens_batch(
                 tokenizer.pad_token_id
             ] if t is not None
         ]
-        for logits in batch_layer_logits.values():
-            logits[:, :, special_ids] = float("-inf")
+        for name, logits in batch_layer_logits.items():
+            if logits.shape[-1] == model.lm_head.out_features:
+                logits[:, :, special_ids] = float("-inf")
+                print(f"[mask] Applied special token mask to {name}.")
+            else:
+                print(f"[skip mask] {name} not vocab-sized ({logits.shape[-1]}).")
 
-    # ---- Stack all layers ----
-    stacked, layer_names = lens.stack_layer_logits(
+
+
+    # ----------------------------------------------------
+    #  Stack all layers
+    # ----------------------------------------------------
+    # ----------------------------------------------------
+    #  Stack all layers
+    # ----------------------------------------------------
+    stacked, layer_names, hidden_dict = lens.stack_layer_logits(
         batch_layer_logits,
         keep_on_device=False,
         skip_embed=not include_embed_tokens,
         include_output=include_output,
+        model=model
     )
 
-    # ---- Build DataFrame ----
+
+    print("[debug] Logit lens batch completed successfully.")
+
+    # ----------------------------------------------------
+    #  Build DataFrame
+    # ----------------------------------------------------
+    if stacked is None:
+        print("[warn] No vocab-projected tensors found; skipping DF creation.")
+        return None
+
     rows = []
     for b in range(batch_size):
         input_ids_seq = inputs.input_ids[b].cpu()
@@ -485,12 +597,27 @@ def _run_logit_lens_batch(
                 "target_ids": input_ids_seq[1:true_len],
                 "logits": logits_cur,
                 "position": torch.arange(true_len - 1),
+                "is_vocab_space": True,
             })
+
+    # Add hidden (non-vocab) activations as metadata
+    for name, tens in hidden_dict.items():
+        rows.append({
+            "prompt_id": None,
+            "prompt_text": None,
+            "dataset": dataset_name,
+            "layer_name": name,
+            "hidden_repr": tens,
+            "is_vocab_space": False,
+        })
+
 
     df = pd.DataFrame(rows)
     if save_path:
         torch.save(df, save_path)
     return df
+
+
 
 
 @torch.no_grad()
@@ -649,7 +776,7 @@ def run_logit_lens_batched(
             print(f"[✓] Saved batch {i}: {batch_path}")
         
         del df_batch, batch_prompts
-        gc.collect()                      # clears CPU memory
+        gc.collect()                      
         if torch.cuda.is_available():
             torch.cuda.empty_cache() 
     print(f"All {len(prompts)} prompts processed.")
