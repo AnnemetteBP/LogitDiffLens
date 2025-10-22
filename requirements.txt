@@ -16,6 +16,7 @@ scipy
 networkx
 scikit-learn
 umap-learn
+pingouin
 
 notebook
 ipykernel
